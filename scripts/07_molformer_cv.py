@@ -1,0 +1,183 @@
+"""
+MoLFormer frozen embeddings + MLP head with 10-fold CV
+
+Evaluation design
+-----------------
+1. D2_training_set_Ki.csv is the development dataset.
+2. StratifiedKFold(n_splits=10, shuffle=True, random_state=42) is applied only to that training dataset.
+3. Each fold trains on 9/10 of the development data and validates on 1/10.
+4. D2_test_scaffold_split_Ki.csv is never part of cross-validation.
+5. After CV, a final model is trained on all development data and evaluated once on the held-out test data.
+6. Threshold-based metrics use one fixed threshold: 0.50.
+7. This file is self-contained and does not import project helper modules.
+"""
+
+# SECTION: Imports, settings, and data
+from pathlib import Path
+import random
+import numpy as np
+import pandas as pd
+
+SEED=42
+N_SPLITS=10
+THRESHOLD=0.50
+random.seed(SEED); np.random.seed(SEED)
+
+def project_root():
+    candidates=[Path.cwd(),Path.cwd().parent]
+    if "__file__" in globals(): candidates.insert(0,Path(__file__).resolve().parents[1])
+    for p in candidates:
+        if (p/"data"/"D2_training_set_Ki.csv").exists(): return p
+    raise FileNotFoundError("Run from the project root, scripts/, or notebooks/.")
+
+ROOT=project_root(); RESULTS=ROOT/"results"; RESULTS.mkdir(exist_ok=True)
+train_df=pd.read_csv(ROOT/"data"/"D2_training_set_Ki.csv")
+test_df=pd.read_csv(ROOT/"data"/"D2_test_scaffold_split_Ki.csv")
+for name,df in [("training",train_df),("test",test_df)]:
+    if not {"SMILES","Activity"}.issubset(df.columns): raise ValueError(f"{name} file must contain SMILES and Activity")
+print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
+print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
+# SECTION: Metrics
+from sklearn.metrics import roc_auc_score,average_precision_score,matthews_corrcoef,balanced_accuracy_score,recall_score,precision_score,brier_score_loss,confusion_matrix
+
+def evaluate(y_true,p_active,threshold=THRESHOLD):
+    y_true=np.asarray(y_true,dtype=int); p_active=np.asarray(p_active,dtype=float)
+    y_pred=(p_active>=threshold).astype(int)
+    tn,fp,fn,tp=confusion_matrix(y_true,y_pred,labels=[0,1]).ravel()
+    return {"ROC_AUC":roc_auc_score(y_true,p_active),"PR_AUC_active":average_precision_score(y_true,p_active),"PR_AUC_inactive":average_precision_score(1-y_true,1-p_active),"MCC":matthews_corrcoef(y_true,y_pred),"BalancedAcc":balanced_accuracy_score(y_true,y_pred),"Recall_active":recall_score(y_true,y_pred,pos_label=1,zero_division=0),"Recall_inactive":recall_score(y_true,y_pred,pos_label=0,zero_division=0),"Precision_active":precision_score(y_true,y_pred,pos_label=1,zero_division=0),"Precision_inactive":precision_score(y_true,y_pred,pos_label=0,zero_division=0),"Brier":brier_score_loss(y_true,p_active),"threshold":threshold,"TN":int(tn),"FP":int(fp),"FN":int(fn),"TP":int(tp)}
+
+def summarize_cv(df, model_name):
+    """Summarize Train, Validation, and Test metrics across the 10 fold-trained models."""
+    cols = [
+        "ROC_AUC", "PR_AUC_active", "PR_AUC_inactive", "MCC", "BalancedAcc",
+        "Recall_active", "Recall_inactive", "Precision_active", "Precision_inactive", "Brier"
+    ]
+    out = {"model": model_name, "n_folds": int(df["fold"].nunique())}
+
+    for split_name, prefix in [
+        ("Train", "CV_Train"),
+        ("Validation", "CV_Validation"),
+        ("Test", "Test"),
+    ]:
+        part = df[df["split"] == split_name]
+        for c in cols:
+            out[f"{prefix}_{c}_mean"] = part[c].mean()
+            out[f"{prefix}_{c}_std"] = part[c].std(ddof=1)
+    return out
+# SECTION: Pretrained encoder
+import torch
+from torch import nn
+from torch.utils.data import DataLoader,TensorDataset
+from sklearn.model_selection import StratifiedKFold
+import matplotlib.pyplot as plt
+from transformers import AutoTokenizer,AutoModel
+
+MODEL_ID='DeepChem/MoLFormer-c3-1.1B'
+TRUST_REMOTE_CODE=True
+EPOCHS=25
+BATCH_SIZE=128
+EMBED_BATCH_SIZE=12
+MAX_LENGTH=256
+torch.manual_seed(SEED)
+DEVICE=torch.device("cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends,"mps") and torch.backends.mps.is_available() else "cpu"))
+
+def prepare_text(smiles):
+    return str(smiles)
+
+def mean_pool(hidden,mask):
+    m=mask.unsqueeze(-1).float(); return (hidden*m).sum(1)/m.sum(1).clamp(min=1e-9)
+
+def extract_embeddings(smiles,cache_path):
+    if cache_path.exists():
+        arr=np.load(cache_path)
+        if len(arr)==len(smiles):
+            print("Loaded cached embeddings:",cache_path.name); return arr.astype(np.float32)
+    texts=[prepare_text(s) for s in smiles]
+    tokenizer=AutoTokenizer.from_pretrained(MODEL_ID,trust_remote_code=TRUST_REMOTE_CODE)
+    encoder=AutoModel.from_pretrained(MODEL_ID,trust_remote_code=TRUST_REMOTE_CODE).to(DEVICE); encoder.eval()
+    chunks=[]
+    for start in range(0,len(texts),EMBED_BATCH_SIZE):
+        b=texts[start:start+EMBED_BATCH_SIZE]
+        tok=tokenizer(b,padding=True,truncation=True,max_length=MAX_LENGTH,return_tensors="pt")
+        tok={k:v.to(DEVICE) for k,v in tok.items()}
+        with torch.no_grad(): out=encoder(**tok); pooled=mean_pool(out.last_hidden_state,tok["attention_mask"])
+        chunks.append(pooled.cpu().numpy().astype(np.float32))
+        print(f"encoded {min(start+EMBED_BATCH_SIZE,len(texts))}/{len(texts)}")
+    arr=np.concatenate(chunks); np.save(cache_path,arr); return arr
+
+X=extract_embeddings(train_df.SMILES,RESULTS/'07_MoLFormer_train_embeddings.npy')
+X_test=extract_embeddings(test_df.SMILES,RESULTS/'07_MoLFormer_test_embeddings.npy')
+y=train_df.Activity.to_numpy(dtype=np.int64); y_test=test_df.Activity.to_numpy(dtype=np.int64)
+
+# SECTION: Supervised classification head
+class Head(nn.Module):
+    def __init__(self,d):
+        super().__init__(); self.net=nn.Sequential(nn.Linear(d,256),nn.ReLU(),nn.Dropout(.25),nn.Linear(256,2))
+    def forward(self,x): return self.net(x)
+
+def class_weights(labels):
+    c=np.bincount(labels,minlength=2).astype(np.float32)
+    return torch.tensor(len(labels)/(2*np.maximum(c,1)),dtype=torch.float32,device=DEVICE)
+
+def train_fold(tr,va):
+    model=Head(X.shape[1]).to(DEVICE); loss_fn=nn.CrossEntropyLoss(weight=class_weights(y[tr])); opt=torch.optim.AdamW(model.parameters(),lr=1e-3,weight_decay=1e-4)
+    loader=DataLoader(TensorDataset(torch.from_numpy(X[tr]),torch.from_numpy(y[tr])),batch_size=BATCH_SIZE,shuffle=True)
+    xv=torch.from_numpy(X[va]).to(DEVICE); yv=torch.from_numpy(y[va]).to(DEVICE)
+    hist={"train_loss":[],"val_loss":[]}; best=None; best_loss=float("inf"); best_epoch=1
+    for ep in range(1,EPOCHS+1):
+        model.train(); total=0.; n=0
+        for xb,yb in loader:
+            xb,yb=xb.to(DEVICE),yb.to(DEVICE); opt.zero_grad(set_to_none=True)
+            loss=loss_fn(model(xb),yb); loss.backward(); opt.step(); total+=loss.item()*len(yb); n+=len(yb)
+        hist["train_loss"].append(total/n)
+        model.eval()
+        with torch.no_grad(): logits=model(xv); vl=loss_fn(logits,yv).item()
+        hist["val_loss"].append(vl)
+        if vl<best_loss:
+            best_loss=vl; best_epoch=ep; best={k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
+    model.load_state_dict(best); model.eval()
+    xt=torch.from_numpy(X[tr]).to(DEVICE)
+    with torch.no_grad():
+        p_train=torch.softmax(model(xt),1)[:,1].cpu().numpy()
+        p_val=torch.softmax(model(xv),1)[:,1].cpu().numpy()
+    return model,p_train,p_val,hist,best_epoch
+
+# SECTION: 10-fold cross-validation
+skf=StratifiedKFold(n_splits=N_SPLITS,shuffle=True,random_state=SEED)
+rows=[]; histories=[]; best_epochs=[]
+for fold,(tr,va) in enumerate(skf.split(X,y),1):
+    model,p_train,p_val,h,b=train_fold(tr,va)
+
+    train_row=evaluate(y[tr],p_train)
+    train_row.update(model='MoLFormer',fold=fold,split="Train",best_epoch=b)
+
+    val_row=evaluate(y[va],p_val)
+    val_row.update(model='MoLFormer',fold=fold,split="Validation",best_epoch=b)
+
+    with torch.no_grad():
+        p_test=torch.softmax(model(torch.from_numpy(X_test).to(DEVICE)),1)[:,1].cpu().numpy()
+    test_row=evaluate(y_test,p_test)
+    test_row.update(model='MoLFormer',fold=fold,split="Test",best_epoch=b)
+
+    rows.extend([train_row,val_row,test_row])
+    histories.append(h); best_epochs.append(b)
+
+    print(
+        f"fold {fold:02d}: "
+        f"Train ROC={train_row['ROC_AUC']:.3f} MCC={train_row['MCC']:.3f} | "
+        f"Validation ROC={val_row['ROC_AUC']:.3f} MCC={val_row['MCC']:.3f} | "
+        f"Test ROC={test_row['ROC_AUC']:.3f} MCC={test_row['MCC']:.3f} | "
+        f"best_epoch={b}"
+    )
+fold_df=pd.DataFrame(rows); summary=summarize_cv(fold_df,'MoLFormer'); summary["CV_best_epoch_median"]=int(np.median(best_epochs))
+
+# SECTION: Epoch vs loss plot
+tr_loss=np.array([h["train_loss"] for h in histories]); va_loss=np.array([h["val_loss"] for h in histories]); ep=np.arange(1,EPOCHS+1)
+plt.figure(figsize=(8,5)); plt.plot(ep,tr_loss.mean(0),label="Training loss"); plt.plot(ep,va_loss.mean(0),label="Validation loss")
+plt.xlabel("Epoch"); plt.ylabel("Cross-entropy loss"); plt.title('MoLFormer: mean learning curve across 10 CV folds'); plt.legend(); plt.tight_layout()
+plt.savefig(RESULTS/'07_MoLFormer_epoch_vs_loss.png',dpi=180); plt.show()
+
+# SECTION: Save fold-level and mean±SD results
+fold_df.to_csv(RESULTS/'07_MoLFormer_cv_folds.csv',index=False)
+pd.DataFrame([summary]).to_csv(RESULTS/'07_MoLFormer_summary.csv',index=False)
+print(pd.DataFrame([summary]).to_string(index=False))
