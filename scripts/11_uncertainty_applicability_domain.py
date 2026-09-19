@@ -1,19 +1,28 @@
 """
-Uncertainty and applicability-domain analysis
+11 | DRD2: Prediction Uncertainty and Applicability Domain
 
-Workflow
---------
-Train one random forest on each CV training subset, then average their predictions on the held-out test set. Report prediction disagreement and maximum fingerprint similarity to development molecules. This is an ensemble analysis, not a final full-data refit; the fold validation indices are unused.
-This file is self-contained and does not import project helper modules.
+Characterize prediction disagreement and structural coverage for held-out DRD2 molecules.
+
+Method
+------
+Train ten random forests on development-fold training subsets, average their test predictions,
+and compute each test molecule's maximum Morgan-fingerprint Tanimoto similarity to development
+molecules.
+
+Outputs
+-------
+Saved under results/:
+- 11_uncertainty_applicability_test.csv
+
+Outcome and Interpretation
+--------------------------
+The exported rows pair ensemble probabilities and prediction standard deviations with nearest-
+development similarity. Disagreement is descriptive rather than a calibrated uncertainty
+interval; similarity characterizes structural coverage. Fold validation subsets are not scored
+in this analysis.
 """
 
-# Workflow guide:
-# Train one random forest on each CV training subset, then average their predictions on the
-# held-out test set. Report prediction disagreement and maximum fingerprint similarity to
-# development molecules. This is an ensemble analysis, not a final full-data refit; the fold
-# validation indices are unused.
-
-# SECTION: Imports, settings, and data
+# SECTION: Configuration and Input Data
 from pathlib import Path
 import random
 import numpy as np
@@ -41,7 +50,7 @@ for name,df in [("training",train_df),("test",test_df)]:
     if not {"SMILES","Activity"}.issubset(df.columns): raise ValueError(f"{name} file must contain SMILES and Activity")
 print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
 print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
-# SECTION: Morgan fingerprints
+# SECTION: Molecular Representation: Morgan Fingerprints
 from rdkit import Chem,DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 FP_SIZE=2048; MORGAN_RADIUS=2
@@ -58,7 +67,7 @@ def morgan_matrix(smiles):
         fp=fp_gen.GetFingerprint(mol); DataStructs.ConvertToNumpyArray(fp,X[i])
     if invalid: raise ValueError(f"Invalid SMILES at rows {invalid[:10]}")
     return X
-# SECTION: Metrics
+# SECTION: Classification Metrics
 from sklearn.metrics import roc_auc_score,average_precision_score,matthews_corrcoef,balanced_accuracy_score,recall_score,precision_score,brier_score_loss,confusion_matrix
 
 # Compare binary labels (0 inactive, 1 active) with P(active).
@@ -80,7 +89,7 @@ def summarize_cv(df,model_name):
     for c in cols:
         out[f"CV_{c}_mean"]=df[c].mean(); out[f"CV_{c}_std"]=df[c].std(ddof=1)
     return out
-# SECTION: CV ensemble uncertainty
+# SECTION: Ensemble Predictions and Structural Similarity
 from sklearn.model_selection import StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier
 from rdkit import DataStructs

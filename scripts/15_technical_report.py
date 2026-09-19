@@ -1,16 +1,24 @@
 """
-Generate a compact technical report from available results
+15 | DRD2: Technical Results Report
 
-Workflow
---------
-Assemble a Markdown report from the existing benchmark CSV and explanatory text. This file does not train models or recompute scores. Run the benchmark collector first to include the latest model summaries.
-This file is self-contained and does not import project helper modules.
+Assemble a shareable Markdown summary of the available DRD2 benchmark results.
+
+Method
+------
+Read results/10_final_benchmark.csv when present and combine it with evaluation-design notes
+and learning-curve interpretation. Run workflow 10 first to include current model summaries.
+
+Outputs
+-------
+Saved under results/:
+- 15_technical_report.md
+
+Outcome and Interpretation
+--------------------------
+The report reflects existing benchmark artifacts and does not recompute metrics or train
+models. If the benchmark is absent, the report includes a placeholder explaining how to
+populate the results.
 """
-
-# Workflow guide:
-# Assemble a Markdown report from the existing benchmark CSV and explanatory text. This file
-# does not train models or recompute scores. Run the benchmark collector first to include the
-# latest model summaries.
 
 from pathlib import Path
 import pandas as pd

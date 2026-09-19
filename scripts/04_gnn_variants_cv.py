@@ -1,23 +1,43 @@
 """
-GNN variants with 10-fold CV and fast defaults
+04 | DRD2: Graph Neural Network Benchmark
 
-Evaluation design
+Compare molecular graph representations for DRD2 activity classification.
+
+Method
+------
+Represent molecules as atom graphs and evaluate GCN and GIN by default, with optional GraphSAGE
+and GAT architectures. Train each architecture independently within every development fold.
+
+Evaluation Design
 -----------------
-1. D2_training_set_Ki.csv is the development dataset.
-2. StratifiedKFold(n_splits=10, shuffle=True, random_state=42) is applied only to that training dataset.
-3. In each fold, 90% of the training data are used to fit the model and 10% are used as validation.
-4. D2_test_scaffold_split_Ki.csv is never part of cross-validation.
-5. Each of the 10 fold-trained models also evaluates the same untouched held-out test set.
-6. Threshold-based metrics use one fixed threshold: 0.50.
-7. This file is self-contained and does not import project helper modules.
+Use D2_training_set_Ki.csv for development and reserve D2_test_scaffold_split_Ki.csv for held-
+out testing. Ten shuffled, stratified folds (seed 42) split development rows into 90% training
+and 10% validation; these folds are not scaffold-grouped. Each fold model evaluates the same
+held-out test molecules. Threshold-based metrics use 0.50, and summaries report means and
+standard deviations across fold models. Test variability describes different fitted models on
+one fixed test set, not independent test datasets.
+
+Training Control
+----------------
+Validation loss controls early stopping (patience 3; minimum improvement 0.0001). Each fold
+restores its lowest-loss checkpoint. Learning curves average only folds that completed a given
+epoch.
+
+Outputs
+-------
+Saved under results/:
+- 04_gnn_cv_folds.csv
+- 04_gnn_summary.csv
+- 04_<model>_epoch_vs_loss.png
+
+Outcome and Interpretation
+--------------------------
+The summary compares the enabled graph architectures, while architecture-specific loss plots
+show training behavior. Interpret differences using validation means and variability under the
+same evaluation design.
 """
 
-# Workflow guide:
-# Represent each molecule as an atom graph, compare GCN and GIN by default, and optionally
-# include GraphSAGE and GAT. Train a fresh graph network per fold, restore its best
-# validation checkpoint, and average the epoch loss curves across folds.
-
-# SECTION: Imports, settings, and data
+# SECTION: Configuration and Input Data
 from pathlib import Path
 import random
 import numpy as np
@@ -58,7 +78,7 @@ for name, df in [("training", train_df), ("test", test_df)]:
 
 print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
 print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
-# SECTION: Evaluation metrics
+# SECTION: Classification Metrics
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, matthews_corrcoef,
     balanced_accuracy_score, recall_score, precision_score,
@@ -111,7 +131,7 @@ def summarize_cv(df, model_name):
             out[f"{prefix}_{c}_mean"] = part[c].mean()
             out[f"{prefix}_{c}_std"] = part[c].std(ddof=1)
     return out
-# SECTION: GNN settings
+# SECTION: Graph Model Configuration
 # 10-fold CV multiplies the training cost by 10. Keep the default comparison modest.
 # Change RUN_EXTENDED_VARIANTS to True only when you intentionally want a longer run.
 # D-MPNN is not run here by default because it was the main runtime bottleneck.
@@ -133,7 +153,7 @@ torch.manual_seed(SEED)
 # Prefer CUDA, then Apple MPS when available, and otherwise use the CPU.
 DEVICE=torch.device("cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends,"mps") and torch.backends.mps.is_available() else "cpu"))
 
-# SECTION: Convert one molecule into one graph
+# SECTION: Molecular Graph Construction
 ATOM_DIM=8
 # Encode eight atom properties as scaled numeric features; these divisors are fixed, not fitted statistics.
 def atom_features(atom):
@@ -169,7 +189,7 @@ test_graphs=[smiles_to_graph(s,y) for s,y in zip(test_df.SMILES,test_df.Activity
 y=train_df.Activity.to_numpy(dtype=np.int64)
 y_test=test_df.Activity.to_numpy(dtype=np.int64)
 
-# SECTION: Small, readable GNN architectures
+# SECTION: Graph Network Architectures
 # Apply two graph convolutions, average node features per molecule, and produce two class logits.
 class GCN(nn.Module):
     def __init__(self):
@@ -302,7 +322,7 @@ def predict_fold(model, indices):
             probs.extend(torch.softmax(model(batch.to(DEVICE)),1)[:,1].cpu().numpy())
     return np.asarray(probs)
 
-# SECTION: CV for each selected GNN
+# SECTION: Graph Model Evaluation and Learning Curves
 # Preserve class proportions when splitting development rows; this is not scaffold-grouped CV.
 skf=StratifiedKFold(n_splits=N_SPLITS,shuffle=True,random_state=SEED)
 all_rows=[]; summaries=[]

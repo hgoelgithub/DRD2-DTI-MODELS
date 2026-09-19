@@ -1,23 +1,43 @@
 """
-Small SMILES Transformer trained with 10-fold CV
+05 | DRD2: SMILES Transformer Classification
 
-Evaluation design
+Evaluate a compact transformer trained from scratch on DRD2 SMILES strings.
+
+Method
+------
+Construct a character vocabulary from development SMILES, apply truncation and padding, and
+train a fresh transformer in each fold. Mask padding during attention and pooling.
+
+Evaluation Design
 -----------------
-1. D2_training_set_Ki.csv is the development dataset.
-2. StratifiedKFold(n_splits=10, shuffle=True, random_state=42) is applied only to that training dataset.
-3. In each fold, 90% of the training data are used to fit the model and 10% are used as validation.
-4. D2_test_scaffold_split_Ki.csv is never part of cross-validation.
-5. Each of the 10 fold-trained models also evaluates the same untouched held-out test set.
-6. Threshold-based metrics use one fixed threshold: 0.50.
-7. This file is self-contained and does not import project helper modules.
+Use D2_training_set_Ki.csv for development and reserve D2_test_scaffold_split_Ki.csv for held-
+out testing. Ten shuffled, stratified folds (seed 42) split development rows into 90% training
+and 10% validation; these folds are not scaffold-grouped. Each fold model evaluates the same
+held-out test molecules. Threshold-based metrics use 0.50, and summaries report means and
+standard deviations across fold models. Test variability describes different fitted models on
+one fixed test set, not independent test datasets.
+
+Training Control
+----------------
+Validation loss controls early stopping (patience 3; minimum improvement 0.0001). Each fold
+restores its lowest-loss checkpoint. Learning curves average only folds that completed a given
+epoch.
+
+Outputs
+-------
+Saved under results/:
+- 05_smiles_transformer_cv_folds.csv
+- 05_smiles_transformer_cv_summary.csv
+- 05_smiles_transformer_epoch_vs_loss.png
+
+Outcome and Interpretation
+--------------------------
+The results provide a sequence-model reference for comparison with fingerprints, molecular
+graphs, and pretrained encoders. The vocabulary is derived from the full development set, while
+model fitting uses each training fold.
 """
 
-# Workflow guide:
-# Build a character vocabulary from development SMILES, encode each string with truncation
-# and padding, and train a small transformer from scratch per fold. Mask padding during
-# attention and pooling; restore the best validation checkpoint before reporting metrics.
-
-# SECTION: Imports, settings, and data
+# SECTION: Configuration and Input Data
 from pathlib import Path
 import random
 import numpy as np
@@ -58,7 +78,7 @@ for name, df in [("training", train_df), ("test", test_df)]:
 
 print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
 print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
-# SECTION: Evaluation metrics
+# SECTION: Classification Metrics
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, matthews_corrcoef,
     balanced_accuracy_score, recall_score, precision_score,
@@ -111,7 +131,7 @@ def summarize_cv(df, model_name):
             out[f"{prefix}_{c}_mean"] = part[c].mean()
             out[f"{prefix}_{c}_std"] = part[c].std(ddof=1)
     return out
-# SECTION: Character tokenizer and compact Transformer
+# SECTION: SMILES Tokenization and Transformer Architecture
 import torch
 from torch import nn
 from torch.utils.data import Dataset,DataLoader
@@ -238,7 +258,7 @@ def fit_fold(tr,va):
         p_val=torch.softmax(model(Xv),1)[:,1].cpu().numpy()
     return model,p_train,p_val,hist,best_epoch
 
-# SECTION: 10-fold CV
+# SECTION: Stratified 10-Fold Evaluation
 # Preserve class proportions when splitting development rows; this is not scaffold-grouped CV.
 skf=StratifiedKFold(n_splits=N_SPLITS,shuffle=True,random_state=SEED)
 rows=[]; histories=[]; best_epochs=[]
@@ -269,7 +289,7 @@ for fold,(tr,va) in enumerate(skf.split(X,y),1):
         f"Test ROC={test_row['ROC_AUC']:.3f} MCC={test_row['MCC']:.3f}"
     )
 
-# SECTION: Learning curve
+# SECTION: Training and Validation Learning Curves
 a=mean_learning_curve(histories, 'train_loss'); b=mean_learning_curve(histories, 'val_loss')
 ep=np.arange(1, max(len(h["train_loss"]) for h in histories) + 1)
 plt.figure(figsize=(8,5)); plt.plot(ep,a,label="Training loss"); plt.plot(ep,b,label="Validation loss")
@@ -282,7 +302,7 @@ summary["CV_best_epoch_median"]=int(np.median(best_epochs))
 fold_df.to_csv(RESULTS/"05_smiles_transformer_cv_folds.csv",index=False)
 pd.DataFrame([summary]).to_csv(RESULTS/"05_smiles_transformer_cv_summary.csv",index=False)
 
-# SECTION: Save fold-level and mean±SD results
+# SECTION: Results Export
 pd.DataFrame([summary]).to_csv(RESULTS/"05_smiles_transformer_cv_summary.csv",index=False)
 
 print("\nThis file focuses on readable supervised Transformer CV. Pretrained molecular encoders are covered separately.")

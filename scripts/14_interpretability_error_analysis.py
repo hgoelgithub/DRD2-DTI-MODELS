@@ -1,19 +1,28 @@
 """
-Random-Forest interpretation and test error analysis
+14 | DRD2: Model Interpretation and Prediction Error Analysis
 
-Workflow
---------
-Fit one random forest on all development data, classify held-out molecules, label prediction errors, and export fingerprint-bit importance. This file does not run CV. Bit importance describes the fitted model and does not directly identify a unique chemical substructure.
-This file is self-contained and does not import project helper modules.
+Examine held-out classification errors and fingerprint feature importance for a DRD2 random
+forest.
+
+Method
+------
+Fit one random forest on all development data, classify the held-out test molecules, label
+false positives and false negatives, and rank fingerprint bits by model importance.
+
+Outputs
+-------
+Saved under results/:
+- 14_test_error_analysis.csv
+- 14_rf_feature_importance.csv
+
+Outcome and Interpretation
+--------------------------
+The error table supports compound-level inspection; the importance table identifies influential
+fingerprint bits in this fitted model. Hashed bits may represent multiple environments, so
+importance alone does not identify a unique chemical substructure.
 """
 
-# Workflow guide:
-# Fit one random forest on all development data, classify held-out molecules, label
-# prediction errors, and export fingerprint-bit importance. This file does not run CV. Bit
-# importance describes the fitted model and does not directly identify a unique chemical
-# substructure.
-
-# SECTION: Imports, settings, and data
+# SECTION: Configuration and Input Data
 from pathlib import Path
 import random
 import numpy as np
@@ -41,7 +50,7 @@ for name,df in [("training",train_df),("test",test_df)]:
     if not {"SMILES","Activity"}.issubset(df.columns): raise ValueError(f"{name} file must contain SMILES and Activity")
 print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
 print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
-# SECTION: Morgan fingerprints
+# SECTION: Molecular Representation: Morgan Fingerprints
 from rdkit import Chem,DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 FP_SIZE=2048; MORGAN_RADIUS=2
@@ -58,7 +67,7 @@ def morgan_matrix(smiles):
         fp=fp_gen.GetFingerprint(mol); DataStructs.ConvertToNumpyArray(fp,X[i])
     if invalid: raise ValueError(f"Invalid SMILES at rows {invalid[:10]}")
     return X
-# SECTION: Metrics
+# SECTION: Classification Metrics
 from sklearn.metrics import roc_auc_score,average_precision_score,matthews_corrcoef,balanced_accuracy_score,recall_score,precision_score,brier_score_loss,confusion_matrix
 
 # Compare binary labels (0 inactive, 1 active) with P(active).
@@ -80,7 +89,7 @@ def summarize_cv(df,model_name):
     for c in cols:
         out[f"CV_{c}_mean"]=df[c].mean(); out[f"CV_{c}_std"]=df[c].std(ddof=1)
     return out
-# SECTION: Fit and inspect errors
+# SECTION: Test Errors and Fingerprint Importance
 from sklearn.ensemble import RandomForestClassifier
 X=morgan_matrix(train_df.SMILES); y=train_df.Activity.to_numpy(dtype=np.int64); X_test=morgan_matrix(test_df.SMILES); y_test=test_df.Activity.to_numpy(dtype=np.int64)
 model=RandomForestClassifier(n_estimators=400,min_samples_leaf=2,class_weight='balanced_subsample',n_jobs=-1,random_state=SEED); model.fit(X,y); p=model.predict_proba(X_test)[:,1]; pred=(p>=THRESHOLD).astype(int)

@@ -1,23 +1,44 @@
 """
-PyTorch MLP with 10-fold CV and learning curves
+03 | DRD2: Fingerprint MLP Classification
 
-Evaluation design
+Evaluate a supervised multilayer perceptron on Morgan fingerprints for DRD2 activity
+prediction.
+
+Method
+------
+Initialize a fresh PyTorch MLP for each development fold. Derive class weights from training-
+fold labels and restore the checkpoint with the lowest validation loss before evaluation.
+
+Evaluation Design
 -----------------
-1. D2_training_set_Ki.csv is the development dataset.
-2. StratifiedKFold(n_splits=10, shuffle=True, random_state=42) is applied only to that training dataset.
-3. In each fold, 90% of the training data are used to fit the model and 10% are used as validation.
-4. D2_test_scaffold_split_Ki.csv is never part of cross-validation.
-5. Each of the 10 fold-trained models also evaluates the same untouched held-out test set.
-6. Threshold-based metrics use one fixed threshold: 0.50.
-7. This file is self-contained and does not import project helper modules.
+Use D2_training_set_Ki.csv for development and reserve D2_test_scaffold_split_Ki.csv for held-
+out testing. Ten shuffled, stratified folds (seed 42) split development rows into 90% training
+and 10% validation; these folds are not scaffold-grouped. Each fold model evaluates the same
+held-out test molecules. Threshold-based metrics use 0.50, and summaries report means and
+standard deviations across fold models. Test variability describes different fitted models on
+one fixed test set, not independent test datasets.
+
+Training Control
+----------------
+Validation loss controls early stopping (patience 3; minimum improvement 0.0001). Each fold
+restores its lowest-loss checkpoint. Learning curves average only folds that completed a given
+epoch.
+
+Outputs
+-------
+Saved under results/:
+- 03_mlp_cv_folds.csv
+- 03_mlp_summary.csv
+- 03_mlp_epoch_vs_loss.png
+
+Outcome and Interpretation
+--------------------------
+Fold metrics quantify predictive performance; the mean training and validation loss curves
+describe convergence and potential overfitting. Compare against the fingerprint baselines to
+assess the contribution of the neural classifier.
 """
 
-# Workflow guide:
-# Build Morgan fingerprints and train a new MLP in each fold. Class weights come from that
-# fold’s training labels. Record completed epochs, restore the lowest-validation-loss checkpoint,
-# and then evaluate training, validation, and test predictions.
-
-# SECTION: Imports, settings, and data
+# SECTION: Configuration and Input Data
 from pathlib import Path
 import random
 import numpy as np
@@ -58,7 +79,7 @@ for name, df in [("training", train_df), ("test", test_df)]:
 
 print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
 print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
-# SECTION: Morgan fingerprints
+# SECTION: Molecular Representation: Morgan Fingerprints
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 
@@ -83,7 +104,7 @@ def morgan_matrix(smiles):
     if invalid:
         raise ValueError(f"Invalid SMILES at rows {invalid[:10]}")
     return X
-# SECTION: Evaluation metrics
+# SECTION: Classification Metrics
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, matthews_corrcoef,
     balanced_accuracy_score, recall_score, precision_score,
@@ -136,7 +157,7 @@ def summarize_cv(df, model_name):
             out[f"{prefix}_{c}_mean"] = part[c].mean()
             out[f"{prefix}_{c}_std"] = part[c].std(ddof=1)
     return out
-# SECTION: PyTorch model and training utilities
+# SECTION: MLP Architecture and Training
 import torch
 from torch import nn
 from torch.utils.data import DataLoader,TensorDataset
@@ -264,7 +285,7 @@ def run_fold(Xtr,ytr,Xva,yva,epochs=EPOCHS):
 
     return model,p_train,p_val,history,best_epoch
 
-# SECTION: 10-fold CV
+# SECTION: Stratified 10-Fold Evaluation
 # Preserve class proportions when splitting development rows; this is not scaffold-grouped CV.
 skf=StratifiedKFold(n_splits=N_SPLITS,shuffle=True,random_state=SEED)
 fold_rows=[]; histories=[]; best_epochs=[]
@@ -300,7 +321,7 @@ fold_df=pd.DataFrame(fold_rows)
 summary=summarize_cv(fold_df,"PyTorch_MLP")
 summary["CV_best_epoch_median"]=int(np.median(best_epochs))
 
-# SECTION: Plot epoch vs training/validation loss
+# SECTION: Training and Validation Learning Curves
 train_losses=mean_learning_curve(histories, 'train_loss')
 val_losses=mean_learning_curve(histories, 'val_loss')
 epochs=np.arange(1, max(len(h["train_loss"]) for h in histories) + 1)
@@ -313,7 +334,7 @@ plt.legend(); plt.tight_layout()
 plt.savefig(RESULTS/"03_mlp_epoch_vs_loss.png",dpi=180)
 plt.show()
 
-# SECTION: Save fold-level and mean±SD results
+# SECTION: Results Export
 # Export fold-level results without adding a pandas index column.
 fold_df.to_csv(RESULTS/"03_mlp_cv_folds.csv",index=False)
 pd.DataFrame([summary]).to_csv(RESULTS/"03_mlp_summary.csv",index=False)

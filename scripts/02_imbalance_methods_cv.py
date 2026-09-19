@@ -1,23 +1,38 @@
 """
-Imbalance-handling methods with 10-fold CV
+02 | DRD2: Class-Imbalance Resampling Benchmark
 
-Evaluation design
+Evaluate how training-set resampling affects DRD2 activity classification while holding the
+logistic-regression classifier fixed.
+
+Method
+------
+Compare no resampling, random oversampling, random undersampling, SMOTE, ADASYN, and SMOTE-
+Tomek. Apply sampling only within each training fold; evaluate original training, validation,
+and test rows.
+
+Evaluation Design
 -----------------
-1. D2_training_set_Ki.csv is the development dataset.
-2. StratifiedKFold(n_splits=10, shuffle=True, random_state=42) is applied only to that training dataset.
-3. In each fold, 90% of the training data are used to fit the model and 10% are used as validation.
-4. D2_test_scaffold_split_Ki.csv is never part of cross-validation.
-5. Each of the 10 fold-trained models also evaluates the same untouched held-out test set.
-6. Threshold-based metrics use one fixed threshold: 0.50.
-7. This file is self-contained and does not import project helper modules.
+Use D2_training_set_Ki.csv for development and reserve D2_test_scaffold_split_Ki.csv for held-
+out testing. Ten shuffled, stratified folds (seed 42) split development rows into 90% training
+and 10% validation; these folds are not scaffold-grouped. Each fold model evaluates the same
+held-out test molecules. Threshold-based metrics use 0.50, and summaries report means and
+standard deviations across fold models. Test variability describes different fitted models on
+one fixed test set, not independent test datasets.
+
+Outputs
+-------
+Saved under results/:
+- 02_imbalance_cv_folds.csv
+- 02_imbalance_summary.csv
+
+Outcome and Interpretation
+--------------------------
+Use validation metrics to assess the balance between active-class sensitivity and inactive-
+class specificity. Synthetic fingerprint interpolation produces feature vectors, not chemically
+validated molecules.
 """
 
-# Workflow guide:
-# Compare six sampling strategies with the same logistic-regression classifier. Resample only
-# the training portion of each fold and score the original training rows plus validation and
-# test rows. Synthetic fingerprint interpolation does not construct actual molecules.
-
-# SECTION: Imports, settings, and data
+# SECTION: Configuration and Input Data
 from pathlib import Path
 import random
 import numpy as np
@@ -58,7 +73,7 @@ for name, df in [("training", train_df), ("test", test_df)]:
 
 print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
 print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
-# SECTION: Morgan fingerprints
+# SECTION: Molecular Representation: Morgan Fingerprints
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 
@@ -83,7 +98,7 @@ def morgan_matrix(smiles):
     if invalid:
         raise ValueError(f"Invalid SMILES at rows {invalid[:10]}")
     return X
-# SECTION: Evaluation metrics
+# SECTION: Classification Metrics
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, matthews_corrcoef,
     balanced_accuracy_score, recall_score, precision_score,
@@ -136,7 +151,7 @@ def summarize_cv(df, model_name):
             out[f"{prefix}_{c}_mean"] = part[c].mean()
             out[f"{prefix}_{c}_std"] = part[c].std(ddof=1)
     return out
-# SECTION: Compare resampling strategies without leakage
+# SECTION: Resampling Within Training Folds
 from sklearn.model_selection import StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 from imblearn.over_sampling import RandomOverSampler, SMOTE, ADASYN

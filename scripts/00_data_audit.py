@@ -1,19 +1,28 @@
 """
-DRD2 data audit and split checks
+00 | DRD2: Data Quality and Split Audit
 
-Workflow
---------
-Audit the supplied splits without training a model: parse molecules, canonicalize SMILES, count duplicate structures, and compare scaffold keys across files. An empty Murcko scaffold is replaced with canonical SMILES, so the scaffold-key overlap is not a pure scaffold-overlap count for acyclic molecules.
-This file is self-contained and does not import project helper modules.
+Assess the molecular integrity, class distribution, and structural overlap of the supplied DRD2
+development and scaffold-test datasets.
+
+Method
+------
+Parse and canonicalize SMILES with RDKit, count duplicate structures, and compare Murcko
+scaffold keys across datasets. Acyclic molecules use canonical SMILES when their Murcko
+scaffold is empty.
+
+Outputs
+-------
+Saved under results/:
+- 00_data_audit.csv
+
+Outcome and Interpretation
+--------------------------
+The audit table summarizes each dataset; canonical-structure and scaffold-key overlaps are
+printed separately. These checks identify potential split-quality concerns without modifying
+either dataset. Scaffold-key overlap includes the acyclic fallback.
 """
 
-# Workflow guide:
-# Audit the supplied splits without training a model: parse molecules, canonicalize SMILES,
-# count duplicate structures, and compare scaffold keys across files. An empty Murcko
-# scaffold is replaced with canonical SMILES, so the scaffold-key overlap is not a pure
-# scaffold-overlap count for acyclic molecules.
-
-# SECTION: Imports, settings, and data
+# SECTION: Configuration and Input Data
 from pathlib import Path
 import random
 import numpy as np
@@ -54,7 +63,7 @@ for name, df in [("training", train_df), ("test", test_df)]:
 
 print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
 print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
-# SECTION: Validate molecules and inspect overlap
+# SECTION: Molecular Validation and Split Overlap
 from rdkit import Chem
 from rdkit.Chem.Scaffolds import MurckoScaffold
 

@@ -1,25 +1,44 @@
-# Reading guide: Tune HEAD_LR, HEAD_HIDDEN, and HEAD_DROPOUT using development
-# validation results. The 0.50 threshold and class weighting remain fixed here.
 """
-ChemBERTa frozen embeddings + normalized MLP head with 10-fold CV
+06 | DRD2: ChemBERTa Frozen-Embedding Classification
 
-Evaluation design
+Evaluate pretrained ChemBERTa molecular features with a supervised normalized classifier for
+DRD2 activity.
+
+Method
+------
+Extract and cache frozen embeddings from DeepChem/ChemBERTa-100M-MLM. Train a fresh
+LayerNorm/MLP head per fold while keeping the encoder fixed.
+
+Evaluation Design
 -----------------
-1. D2_training_set_Ki.csv is the development dataset.
-2. StratifiedKFold(n_splits=10, shuffle=True, random_state=42) is applied only to that training dataset.
-3. Each fold trains on 9/10 of the development data and validates on 1/10.
-4. D2_test_scaffold_split_Ki.csv is never part of cross-validation.
-5. Each fold-trained model evaluates the same held-out test data; no final full-data model is trained.
-6. Threshold-based metrics use one fixed threshold: 0.50.
-7. This file is self-contained and does not import project helper modules.
+Use D2_training_set_Ki.csv for development and reserve D2_test_scaffold_split_Ki.csv for held-
+out testing. Ten shuffled, stratified folds (seed 42) split development rows into 90% training
+and 10% validation; these folds are not scaffold-grouped. Each fold model evaluates the same
+held-out test molecules. Threshold-based metrics use 0.50, and summaries report means and
+standard deviations across fold models. Test variability describes different fitted models on
+one fixed test set, not independent test datasets.
+
+Training Control
+----------------
+Validation loss controls early stopping (patience 3; minimum improvement 0.0001). Each fold
+restores its lowest-loss checkpoint. Learning curves average only folds that completed a given
+epoch.
+
+Outputs
+-------
+Saved under results/:
+- 06_ChemBERTa_frozen_LayerNorm_cv_folds.csv
+- 06_ChemBERTa_frozen_LayerNorm_summary.csv
+- 06_ChemBERTa_frozen_LayerNorm_epoch_vs_loss.png
+
+Outcome and Interpretation
+--------------------------
+The outputs measure the utility of frozen ChemBERTa features. Compare with workflow 06B to
+assess partial encoder fine-tuning. Regenerate embedding caches when input molecules, row
+order, or encoder settings change.
 """
 
-# Workflow guide:
-# Reuse cached frozen embeddings, then train a fresh LayerNorm/MLP per fold.
-# Only the small head is optimized; the encoder runs once per uncached dataset.
-# For encoder fine-tuning, use 06B_chemberta_finetuning_cv instead.
-
-# SECTION: Imports, settings, and data
+# SECTION: Configuration and Input Data
 from pathlib import Path
 import random
 import numpy as np
@@ -51,7 +70,7 @@ for name,df in [("training",train_df),("test",test_df)]:
     if not {"SMILES","Activity"}.issubset(df.columns): raise ValueError(f"{name} file must contain SMILES and Activity")
 print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
 print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
-# SECTION: Metrics
+# SECTION: Classification Metrics
 from sklearn.metrics import roc_auc_score,average_precision_score,matthews_corrcoef,balanced_accuracy_score,recall_score,precision_score,brier_score_loss,confusion_matrix
 
 # Step 2: Score predicted probabilities and thresholded class predictions.
@@ -90,7 +109,7 @@ def summarize_cv(df, model_name):
             out[f"{prefix}_{c}_mean"] = part[c].mean()
             out[f"{prefix}_{c}_std"] = part[c].std(ddof=1)
     return out
-# SECTION: Frozen encoder and cached embeddings
+# SECTION: Frozen Encoder and Embedding Cache
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -153,7 +172,7 @@ X_test = extract_embeddings(test_df.SMILES, RESULTS / "06_ChemBERTa_test_embeddi
 y = train_df.Activity.to_numpy(dtype=np.int64)
 y_test = test_df.Activity.to_numpy(dtype=np.int64)
 
-# SECTION: Normalized classifier and fold training
+# SECTION: Normalized Classifier and Fold Training
 class Head(nn.Module):
     def __init__(self, d):
         super().__init__()
@@ -274,7 +293,7 @@ def train_fold(tr, va):
     p_val, _ = predict(model, val_loader)
     return model, p_train, p_val, hist, best_epoch
 
-# SECTION: 10-fold cross-validation
+# SECTION: Stratified 10-Fold Evaluation
 # Step 7: Split only the development data into 10 folds, preserving class proportions.
 # Each run trains on 9 folds and validates on the remaining fold. These CV splits
 # are stratified by activity, not grouped by molecular scaffold.
@@ -311,7 +330,7 @@ for fold,(tr,va) in enumerate(skf.split(np.zeros(len(y)),y),1):
 # the code does not use it to train another model.
 fold_df=pd.DataFrame(rows); summary=summarize_cv(fold_df,MODEL_NAME); summary["CV_best_epoch_median"]=int(np.median(best_epochs))
 
-# SECTION: Epoch vs loss plot
+# SECTION: Training and Validation Learning Curves
 # Step 8: Form [folds, epochs] loss arrays and average across folds at each epoch.
 # These curves show completed epochs only; later points may average fewer folds.
 tr_loss=mean_learning_curve(histories, 'train_loss'); va_loss=mean_learning_curve(histories, 'val_loss'); ep=np.arange(1, max(len(h["train_loss"]) for h in histories) + 1)
@@ -320,7 +339,7 @@ plt.xlabel("Epoch"); plt.ylabel("Cross-entropy loss"); plt.title('Frozen ChemBER
 # Save the learning-curve PNG before displaying it in the notebook.
 plt.savefig(RESULTS/f"{OUTPUT_PREFIX}_epoch_vs_loss.png",dpi=180); plt.show()
 
-# SECTION: Save fold-level and mean±SD results
+# SECTION: Results Export
 # Step 9: Export per-fold Train/Validation/Test metrics and one summary row.
 # Separate filenames preserve the frozen baseline. Model weights are not saved.
 fold_df.to_csv(RESULTS/f"{OUTPUT_PREFIX}_cv_folds.csv",index=False)

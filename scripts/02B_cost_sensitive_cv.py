@@ -1,23 +1,36 @@
 """
-Cost-sensitive Random Forest with 10-fold CV
+02B | DRD2: Cost-Sensitive Random Forest Benchmark
 
-Evaluation design
+Measure the effect of increasing the penalty for misclassifying inactive DRD2 compounds.
+
+Method
+------
+Compare inactive-class weights of 1, 2, 5, 10, and 20 with the active-class weight fixed at 1.
+Each setting uses the same Morgan fingerprints, development folds, and decision threshold.
+
+Evaluation Design
 -----------------
-1. D2_training_set_Ki.csv is the development dataset.
-2. StratifiedKFold(n_splits=10, shuffle=True, random_state=42) is applied only to that training dataset.
-3. Each fold trains on 9/10 of the development data and validates on 1/10.
-4. D2_test_scaffold_split_Ki.csv is never part of cross-validation.
-5. After CV, a final model is trained on all development data and evaluated once on the held-out test data.
-6. Threshold-based metrics use one fixed threshold: 0.50.
-7. This file is self-contained and does not import project helper modules.
+Use D2_training_set_Ki.csv for development and reserve D2_test_scaffold_split_Ki.csv for held-
+out testing. Ten shuffled, stratified folds (seed 42) split development rows into 90% training
+and 10% validation; these folds are not scaffold-grouped. Each fold model evaluates the same
+held-out test molecules. Threshold-based metrics use 0.50, and summaries report means and
+standard deviations across fold models. Test variability describes different fitted models on
+one fixed test set, not independent test datasets.
+
+Outputs
+-------
+Saved under results/:
+- 02B_cost_sensitive_cv_folds.csv
+- 02B_cost_sensitive_summary.csv
+
+Outcome and Interpretation
+--------------------------
+Weight 1 provides the unweighted reference. Compare class-specific validation metrics when
+selecting a weight; held-out test performance is reported for each fold model, with no final
+full-data refit.
 """
 
-# Workflow guide:
-# Compare explicit inactive-class weights in a random forest, keeping the same folds and 0.50
-# prediction cutoff. Weight 1 is the unweighted reference. Use development validation results
-# to compare settings; test results should not select the weight.
-
-# SECTION: Imports, settings, and data
+# SECTION: Configuration and Input Data
 from pathlib import Path
 import random
 import numpy as np
@@ -45,7 +58,7 @@ for name,df in [("training",train_df),("test",test_df)]:
     if not {"SMILES","Activity"}.issubset(df.columns): raise ValueError(f"{name} file must contain SMILES and Activity")
 print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
 print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
-# SECTION: Morgan fingerprints
+# SECTION: Molecular Representation: Morgan Fingerprints
 from rdkit import Chem,DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 FP_SIZE=2048; MORGAN_RADIUS=2
@@ -62,7 +75,7 @@ def morgan_matrix(smiles):
         fp=fp_gen.GetFingerprint(mol); DataStructs.ConvertToNumpyArray(fp,X[i])
     if invalid: raise ValueError(f"Invalid SMILES at rows {invalid[:10]}")
     return X
-# SECTION: Metrics
+# SECTION: Classification Metrics
 from sklearn.metrics import roc_auc_score,average_precision_score,matthews_corrcoef,balanced_accuracy_score,recall_score,precision_score,brier_score_loss,confusion_matrix
 
 # Compare binary labels (0 inactive, 1 active) with P(active).
@@ -96,7 +109,7 @@ def summarize_cv(df, model_name):
             out[f"{prefix}_{c}_mean"] = part[c].mean()
             out[f"{prefix}_{c}_std"] = part[c].std(ddof=1)
     return out
-# SECTION: Compare inactive-class weights
+# SECTION: Class-Weight Comparison
 from sklearn.model_selection import StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier
 

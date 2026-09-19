@@ -1,19 +1,28 @@
 """
-Simple model-guided analog generation
+13 | DRD2: Model-Guided Molecular Candidate Generation
 
-Workflow
---------
-Fit a random-forest scorer on all development molecules, fragment a sample of active compounds with BRICS, recombine fragments, filter molecular weight, and rank up to 500 candidates. This is candidate generation, not CV; predicted scores do not establish experimental activity or synthetic feasibility.
-This file is self-contained and does not import project helper modules.
+Generate and prioritize DRD2 analog candidates using fragment recombination and a learned
+activity scorer.
+
+Method
+------
+Fit a random forest on all development molecules, derive BRICS fragments from sampled active
+compounds, and recombine them at limited depth. Retain molecular weights from 150 to 650 and
+score up to 500 candidates.
+
+Outputs
+-------
+Saved under results/:
+- 13_generated_candidates.csv (when candidates are generated)
+
+Outcome and Interpretation
+--------------------------
+The ranked table contains candidate SMILES and predicted active-class probabilities. Scores
+support prioritization but do not establish experimental activity, novelty, or synthetic
+feasibility. If no candidate passes generation and filtering, no candidate CSV is written.
 """
 
-# Workflow guide:
-# Fit a random-forest scorer on all development molecules, fragment a sample of active
-# compounds with BRICS, recombine fragments, filter molecular weight, and rank up to 500
-# candidates. This is candidate generation, not CV; predicted scores do not establish
-# experimental activity or synthetic feasibility.
-
-# SECTION: Imports, settings, and data
+# SECTION: Configuration and Input Data
 from pathlib import Path
 import random
 import numpy as np
@@ -41,7 +50,7 @@ for name,df in [("training",train_df),("test",test_df)]:
     if not {"SMILES","Activity"}.issubset(df.columns): raise ValueError(f"{name} file must contain SMILES and Activity")
 print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
 print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
-# SECTION: Morgan fingerprints
+# SECTION: Molecular Representation: Morgan Fingerprints
 from rdkit import Chem,DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 FP_SIZE=2048; MORGAN_RADIUS=2
@@ -58,7 +67,7 @@ def morgan_matrix(smiles):
         fp=fp_gen.GetFingerprint(mol); DataStructs.ConvertToNumpyArray(fp,X[i])
     if invalid: raise ValueError(f"Invalid SMILES at rows {invalid[:10]}")
     return X
-# SECTION: Fit scorer and build a limited BRICS candidate set
+# SECTION: BRICS Generation and Activity Ranking
 from sklearn.ensemble import RandomForestClassifier
 from rdkit.Chem import BRICS,Descriptors
 X=morgan_matrix(train_df.SMILES); y=train_df.Activity.to_numpy(dtype=np.int64); model=RandomForestClassifier(n_estimators=300,class_weight='balanced_subsample',n_jobs=-1,random_state=SEED); model.fit(X,y)

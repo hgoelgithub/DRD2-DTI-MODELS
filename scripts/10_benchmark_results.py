@@ -1,16 +1,24 @@
 """
-Collect available CV and test summaries
+10 | DRD2: Consolidated Model Benchmark
 
-Workflow
---------
-Read existing model summary CSVs and combine their columns into one benchmark table. This file does not train or evaluate models. Missing metrics remain empty when different summaries have different columns.
-This file is self-contained and does not import project helper modules.
+Combine available model summaries into a single traceable DRD2 benchmark table.
+
+Method
+------
+Read results/*summary.csv files containing a model column, retain each source filename, and
+align metric columns across workflows. Model training and metric computation occur upstream.
+
+Outputs
+-------
+Saved under results/:
+- 10_final_benchmark.csv
+
+Outcome and Interpretation
+--------------------------
+The combined table reflects only the summary files currently present. Missing columns remain
+empty; inspect source files and evaluation protocols before comparing rows. Rerun after
+updating model results.
 """
-
-# Workflow guide:
-# Read existing model summary CSVs and combine their columns into one benchmark table. This
-# file does not train or evaluate models. Missing metrics remain empty when different
-# summaries have different columns.
 
 from pathlib import Path
 import pandas as pd

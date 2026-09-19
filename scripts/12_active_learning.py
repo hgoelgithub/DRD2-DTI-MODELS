@@ -1,19 +1,27 @@
 """
-Pool-based active-learning simulation
+12 | DRD2: Pool-Based Active-Learning Simulation
 
-Workflow
---------
-Simulate pool-based acquisition within the development data: start with 80 active and 40 inactive labels, fit a forest, and acquire up to 100 predictions closest to 0.50 per round. Labels already exist in the dataset and are revealed by moving rows into the labeled pool. No CV or held-out performance evaluation runs here.
-This file is self-contained and does not import project helper modules.
+Simulate uncertainty-driven selection of additional DRD2 labels from the development dataset.
+
+Method
+------
+Start with 80 active and 40 inactive labeled examples. Refit a random forest and acquire up to
+100 pool predictions closest to 0.50 per round, for at most ten rounds. Existing labels are
+revealed through acquisition.
+
+Outputs
+-------
+Saved under results/:
+- 12_active_learning_history.csv
+
+Outcome and Interpretation
+--------------------------
+The history records labeled and pool sizes before each acquisition. It documents sampling
+progression; no held-out evaluation or random-acquisition comparison is performed, so it does
+not establish a predictive-performance gain.
 """
 
-# Workflow guide:
-# Simulate pool-based acquisition within the development data: start with 80 active and 40
-# inactive labels, fit a forest, and acquire up to 100 predictions closest to 0.50 per round.
-# Labels already exist in the dataset and are revealed by moving rows into the labeled pool.
-# No CV or held-out performance evaluation runs here.
-
-# SECTION: Imports, settings, and data
+# SECTION: Configuration and Input Data
 from pathlib import Path
 import random
 import numpy as np
@@ -41,7 +49,7 @@ for name,df in [("training",train_df),("test",test_df)]:
     if not {"SMILES","Activity"}.issubset(df.columns): raise ValueError(f"{name} file must contain SMILES and Activity")
 print(f"Training: {train_df.shape} | active fraction={train_df.Activity.mean():.4f}")
 print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f}")
-# SECTION: Morgan fingerprints
+# SECTION: Molecular Representation: Morgan Fingerprints
 from rdkit import Chem,DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 FP_SIZE=2048; MORGAN_RADIUS=2
@@ -58,7 +66,7 @@ def morgan_matrix(smiles):
         fp=fp_gen.GetFingerprint(mol); DataStructs.ConvertToNumpyArray(fp,X[i])
     if invalid: raise ValueError(f"Invalid SMILES at rows {invalid[:10]}")
     return X
-# SECTION: Active-learning loop
+# SECTION: Uncertainty-Based Acquisition
 from sklearn.ensemble import RandomForestClassifier
 X=morgan_matrix(train_df.SMILES); y=train_df.Activity.to_numpy(dtype=np.int64); rng=np.random.default_rng(SEED)
 # Initialize a labeled subset containing both classes; the sample sizes assume enough rows per class.
