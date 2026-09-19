@@ -1,20 +1,21 @@
 """
 Generate a compact technical report from available results
 
-Evaluation design
------------------
-1. D2_training_set_Ki.csv is the development dataset.
-2. StratifiedKFold(n_splits=10, shuffle=True, random_state=42) is applied only to that training dataset.
-3. Each fold trains on 9/10 of the development data and validates on 1/10.
-4. D2_test_scaffold_split_Ki.csv is never part of cross-validation.
-5. After CV, a final model is trained on all development data and evaluated once on the held-out test data.
-6. Threshold-based metrics use one fixed threshold: 0.50.
-7. This file is self-contained and does not import project helper modules.
+Workflow
+--------
+Assemble a Markdown report from the existing benchmark CSV and explanatory text. This file does not train models or recompute scores. Run the benchmark collector first to include the latest model summaries.
+This file is self-contained and does not import project helper modules.
 """
+
+# Workflow guide:
+# Assemble a Markdown report from the existing benchmark CSV and explanatory text. This file
+# does not train models or recompute scores. Run the benchmark collector first to include the
+# latest model summaries.
 
 from pathlib import Path
 import pandas as pd
 
+# Find the directory containing both data/ and results/ before reading saved artifacts.
 def root():
     for p in [Path.cwd(),Path.cwd().parent,Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()]:
         if (p/'results').exists() and (p/'data').exists(): return p
@@ -32,7 +33,9 @@ lines=[
     '- Fixed classification threshold: 0.50','',
     '## Available model results'
 ]
+# Include the existing benchmark when available; otherwise provide instructions to generate it.
 if bench.exists(): lines.append(pd.read_csv(bench).to_markdown(index=False))
 else: lines.append('Run model scripts and `10_benchmark_results.py` to populate the benchmark.')
 lines += ['','## Learning curves','Deep-learning scripts save epoch-vs-training/validation-loss PNG files in `results/`.','Training loss decreasing while validation loss rises is a classic overfitting pattern.','Both losses remaining high can indicate underfitting.']
+# Join report sections and write the Markdown artifact into results/.
 report='\n'.join(lines); (R/'15_technical_report.md').write_text(report); print(report)

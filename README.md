@@ -21,6 +21,8 @@ The main notebooks/scripts deliberately repeat the small amount of code they nee
 
 ## Learning curves
 
+Neural workflows `03`–`09` (including `06B`) use validation-loss early stopping. `EARLY_STOPPING_PATIENCE=3` and `EARLY_STOPPING_MIN_DELTA=1e-4` are configurable in each file. Existing epoch settings are maximum budgets. Each fold restores its lowest-validation-loss checkpoint, and learning curves average only folds that reached each epoch.
+
 The MLP, GNN, SMILES Transformer, ChemBERTa, MoLFormer, SELFormer, and ESM-2 conditioning workflows plot and save **epoch vs training loss and validation loss**. This makes overfitting/underfitting visible.
 
 - training and validation loss both high -> likely underfitting
@@ -33,7 +35,9 @@ The MLP, GNN, SMILES Transformer, ChemBERTa, MoLFormer, SELFormer, and ESM-2 con
 
 ## Pretrained encoders
 
-ChemBERTa (`06`) fine-tunes its final two transformer blocks in each CV fold and uses LayerNorm before its classifier head. Each fold starts from the pretrained encoder; earlier blocks remain frozen. Tokenization is shared, but cached frozen embeddings are not used. Its outputs use the `06_ChemBERTa_finetuned` prefix to preserve the earlier frozen baseline. Fine-tuning takes substantially more compute than training on cached embeddings.
+ChemBERTa (`06`) reuses frozen embedding caches and trains a LayerNorm/MLP head per CV fold. It writes `06_ChemBERTa_frozen_LayerNorm_*` results, preserving the earlier baseline.
+
+The optional `06B_chemberta_finetuning_cv` script/notebook fine-tunes the final two encoder blocks plus the normalized head, reloading pretrained weights per fold. It writes `06B_ChemBERTa_finetuned_*` results and takes substantially more compute. Both workflows use 10 folds and the fixed 0.50 threshold.
 
 MoLFormer and SELFormer are used as frozen molecular encoders. Their embeddings are computed once per dataset and cached by that same file; a small PyTorch classifier head is then evaluated with 10-fold CV. No credential is hard-coded.
 

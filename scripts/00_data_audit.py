@@ -1,16 +1,17 @@
 """
 DRD2 data audit and split checks
 
-Evaluation design
------------------
-1. D2_training_set_Ki.csv is the development dataset.
-2. StratifiedKFold(n_splits=10, shuffle=True, random_state=42) is applied only to that training dataset.
-3. In each fold, 90% of the training data are used to fit the model and 10% are used as validation.
-4. D2_test_scaffold_split_Ki.csv is never part of cross-validation.
-5. Each of the 10 fold-trained models also evaluates the same untouched held-out test set.
-6. Threshold-based metrics use one fixed threshold: 0.50.
-7. This file is self-contained and does not import project helper modules.
+Workflow
+--------
+Audit the supplied splits without training a model: parse molecules, canonicalize SMILES, count duplicate structures, and compare scaffold keys across files. An empty Murcko scaffold is replaced with canonical SMILES, so the scaffold-key overlap is not a pure scaffold-overlap count for acyclic molecules.
+This file is self-contained and does not import project helper modules.
 """
+
+# Workflow guide:
+# Audit the supplied splits without training a model: parse molecules, canonicalize SMILES,
+# count duplicate structures, and compare scaffold keys across files. An empty Murcko
+# scaffold is replaced with canonical SMILES, so the scaffold-key overlap is not a pure
+# scaffold-overlap count for acyclic molecules.
 
 # SECTION: Imports, settings, and data
 from pathlib import Path
@@ -18,13 +19,16 @@ import random
 import numpy as np
 import pandas as pd
 
+# Set reproducible pseudo-random seeds; hardware and library differences can still affect results.
 SEED = 42
 N_SPLITS = 10
+# Use the same active-class cutoff throughout this workflow; this is not a tuned threshold.
 THRESHOLD = 0.50
 
 random.seed(SEED)
 np.random.seed(SEED)
 
+# Locate the project from script or notebook execution; notebooks may not define __file__.
 def project_root():
     """Find repository root when run from root, scripts/, or a notebook."""
     candidates = [Path.cwd(), Path.cwd().parent]
@@ -54,10 +58,12 @@ print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f
 from rdkit import Chem
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
+# Parse and standardize the molecular representation so equivalent input strings can match.
 def canonical_smiles(s):
     mol = Chem.MolFromSmiles(str(s))
     return None if mol is None else Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
 
+# Extract a ring/linker scaffold; use canonical SMILES when the scaffold is empty.
 def scaffold_key(s):
     mol = Chem.MolFromSmiles(str(s))
     if mol is None:

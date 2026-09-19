@@ -12,19 +12,27 @@ Evaluation design
 7. This file is self-contained and does not import project helper modules.
 """
 
+# Workflow guide:
+# Represent each molecule as an atom graph, compare GCN and GIN by default, and optionally
+# include GraphSAGE and GAT. Train a fresh graph network per fold, restore its best
+# validation checkpoint, and average the epoch loss curves across folds.
+
 # SECTION: Imports, settings, and data
 from pathlib import Path
 import random
 import numpy as np
 import pandas as pd
 
+# Set reproducible pseudo-random seeds; hardware and library differences can still affect results.
 SEED = 42
 N_SPLITS = 10
+# Use the same active-class cutoff throughout this workflow; this is not a tuned threshold.
 THRESHOLD = 0.50
 
 random.seed(SEED)
 np.random.seed(SEED)
 
+# Locate the project from script or notebook execution; notebooks may not define __file__.
 def project_root():
     """Find repository root when run from root, scripts/, or a notebook."""
     candidates = [Path.cwd(), Path.cwd().parent]
@@ -57,6 +65,10 @@ from sklearn.metrics import (
     brier_score_loss, confusion_matrix
 )
 
+# Compare binary labels (0 inactive, 1 active) with P(active).
+# ROC AUC measures ranking; PR_AUC keys use average precision, not trapezoidal area.
+# MCC and balanced accuracy summarize label predictions; Brier measures probability error.
+# Reversing labels/probabilities lets the same metrics describe the inactive class.
 def evaluate(y_true, p_active, threshold=THRESHOLD):
     """Evaluate probabilities using the same 0.50 threshold for every classifier."""
     y_true = np.asarray(y_true, dtype=int)
@@ -78,6 +90,9 @@ def evaluate(y_true, p_active, threshold=THRESHOLD):
         "TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp),
     }
 
+# Aggregate metric means and sample standard deviations (ddof=1).
+# When split-specific rows exist, keep Train, Validation, and Test summaries separate.
+# Repeated test predictions come from different models on the same molecules.
 def summarize_cv(df, model_name):
     """Summarize Train, Validation, and Test metrics across the 10 fold-trained models."""
     cols = [
@@ -101,7 +116,7 @@ def summarize_cv(df, model_name):
 # Change RUN_EXTENDED_VARIANTS to True only when you intentionally want a longer run.
 # D-MPNN is not run here by default because it was the main runtime bottleneck.
 RUN_EXTENDED_VARIANTS=False
-EPOCHS=12
+EPOCHS = 500
 BATCH_SIZE=128
 
 import torch
@@ -115,10 +130,12 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv,SAGEConv,GATv2Conv,GINConv,global_mean_pool
 
 torch.manual_seed(SEED)
+# Prefer CUDA, then Apple MPS when available, and otherwise use the CPU.
 DEVICE=torch.device("cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends,"mps") and torch.backends.mps.is_available() else "cpu"))
 
 # SECTION: Convert one molecule into one graph
 ATOM_DIM=8
+# Encode eight atom properties as scaled numeric features; these divisors are fixed, not fitted statistics.
 def atom_features(atom):
     return [
         atom.GetAtomicNum()/100.0,
@@ -131,6 +148,8 @@ def atom_features(atom):
         int(atom.GetHybridization())/10.0,
     ]
 
+# Create node features and two directed edges per chemical bond.
+# No bond-type features are passed to the graph convolutions in this implementation.
 def smiles_to_graph(smiles,label=None):
     mol=Chem.MolFromSmiles(str(smiles))
     if mol is None: raise ValueError(f"Invalid SMILES: {smiles}")
@@ -138,6 +157,7 @@ def smiles_to_graph(smiles,label=None):
     src=[]; dst=[]
     for b in mol.GetBonds():
         i,j=b.GetBeginAtomIdx(),b.GetEndAtomIdx()
+        # Store both bond directions for message passing between the two atoms.
         src += [i,j]; dst += [j,i]
     edge_index=torch.tensor([src,dst],dtype=torch.long) if src else torch.empty((2,0),dtype=torch.long)
     data=Data(x=x,edge_index=edge_index)
@@ -150,6 +170,7 @@ y=train_df.Activity.to_numpy(dtype=np.int64)
 y_test=test_df.Activity.to_numpy(dtype=np.int64)
 
 # SECTION: Small, readable GNN architectures
+# Apply two graph convolutions, average node features per molecule, and produce two class logits.
 class GCN(nn.Module):
     def __init__(self):
         super().__init__()
@@ -159,6 +180,7 @@ class GCN(nn.Module):
         x=F.relu(self.c2(x,data.edge_index))
         return self.out(global_mean_pool(x,data.batch))
 
+# Aggregate neighboring atom features twice before molecule-level mean pooling.
 class GraphSAGE(nn.Module):
     def __init__(self):
         super().__init__()
@@ -167,6 +189,7 @@ class GraphSAGE(nn.Module):
         x=F.relu(self.c1(data.x,data.edge_index)); x=F.relu(self.c2(x,data.edge_index))
         return self.out(global_mean_pool(x,data.batch))
 
+# Use attention-weighted neighbor messages; the first layer concatenates two attention heads.
 class GAT(nn.Module):
     def __init__(self):
         super().__init__()
@@ -175,6 +198,7 @@ class GAT(nn.Module):
         x=F.elu(self.c1(data.x,data.edge_index)); x=F.elu(self.c2(x,data.edge_index))
         return self.out(global_mean_pool(x,data.batch))
 
+# Use MLP-based graph convolutions followed by mean pooling across atoms.
 class GIN(nn.Module):
     def __init__(self):
         super().__init__()
@@ -185,13 +209,49 @@ class GIN(nn.Module):
         x=F.relu(self.c1(data.x,data.edge_index)); x=F.relu(self.c2(x,data.edge_index))
         return self.out(global_mean_pool(x,data.batch))
 
+# Keep the default graph experiment smaller; the flag below enables the additional architectures.
 models={"GCN":GCN,"GIN":GIN}
 if RUN_EXTENDED_VARIANTS:
     models.update({"GraphSAGE":GraphSAGE,"GAT":GAT})
 
+# Increase the loss contribution of the less frequent class using training-fold counts.
 def weights(labels):
     c=np.bincount(labels,minlength=2).astype(np.float32)
     return torch.tensor(len(labels)/(2*np.maximum(c,1)),dtype=torch.float32,device=DEVICE)
+
+# Train one graph architecture on training graphs; validation loss chooses the restored checkpoint.
+# Stop after three epochs without a meaningful validation-loss improvement.
+# EPOCHS remains the maximum budget; test metrics never control stopping.
+EARLY_STOPPING_PATIENCE = 3
+EARLY_STOPPING_MIN_DELTA = 1e-4
+
+class EarlyStopping:
+    def __init__(self, patience=EARLY_STOPPING_PATIENCE, min_delta=EARLY_STOPPING_MIN_DELTA):
+        if patience < 1 or min_delta < 0:
+            raise ValueError("patience must be positive and min_delta nonnegative")
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best = float("inf")
+        self.wait = 0
+
+    def update(self, loss):
+        if not np.isfinite(loss):
+            raise RuntimeError("Non-finite validation loss")
+        if loss < self.best - self.min_delta:
+            self.best = loss
+            self.wait = 0
+        else:
+            self.wait += 1
+        return self.wait >= self.patience
+
+def mean_learning_curve(histories, key):
+    # Average only folds that actually reached an epoch; never invent later losses.
+    # Later points can therefore represent fewer folds than earlier points.
+    length = max(len(h[key]) for h in histories)
+    padded = np.full((len(histories), length), np.nan)
+    for i, history in enumerate(histories):
+        padded[i, :len(history[key])] = history[key]
+    return np.nanmean(padded, axis=0)
 
 def train_one(model_cls,tr_idx,va_idx):
     model=model_cls().to(DEVICE)
@@ -201,10 +261,12 @@ def train_one(model_cls,tr_idx,va_idx):
     va_loader=DataLoader([train_graphs[i] for i in va_idx],batch_size=BATCH_SIZE,shuffle=False)
 
     hist={"train_loss":[],"val_loss":[]}; best=None; best_loss=float("inf"); best_epoch=1
+    stopper = EarlyStopping()
     for epoch in range(1,EPOCHS+1):
         model.train(); total=0.; n=0
         for batch in tr_loader:
             batch=batch.to(DEVICE); opt.zero_grad(set_to_none=True)
+            # Calculate supervised loss, backpropagate gradients, and update model parameters.
             loss=loss_fn(model(batch),batch.y.view(-1)); loss.backward(); opt.step()
             total+=loss.item()*batch.num_graphs; n+=batch.num_graphs
         hist["train_loss"].append(total/n)
@@ -217,12 +279,19 @@ def train_one(model_cls,tr_idx,va_idx):
                 total+=loss.item()*batch.num_graphs; n+=batch.num_graphs
                 probs.extend(torch.softmax(logits,1)[:,1].cpu().numpy())
         vloss=total/n; hist["val_loss"].append(vloss)
+        # Select the checkpoint using validation loss, without consulting test labels.
         if vloss<best_loss:
             best_loss=vloss; best_epoch=epoch
             best={k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
+        # Checkpoint selection above still keeps the absolute lowest loss.
+        if stopper.update(vloss):
+            print(f"Early stopping after {len(hist['val_loss'])} epochs; restoring best checkpoint.")
+            break
+    # Restore the chosen checkpoint before reporting predictions.
     model.load_state_dict(best)
     return model,hist,best_epoch
 
+# Preserve molecule order during inference; softmax column 1 is the active-class probability.
 def predict_fold(model, indices):
     """Predict active probabilities for selected graph indices."""
     loader=DataLoader([train_graphs[i] for i in indices],batch_size=BATCH_SIZE,shuffle=False)
@@ -234,6 +303,7 @@ def predict_fold(model, indices):
     return np.asarray(probs)
 
 # SECTION: CV for each selected GNN
+# Preserve class proportions when splitting development rows; this is not scaffold-grouped CV.
 skf=StratifiedKFold(n_splits=N_SPLITS,shuffle=True,random_state=SEED)
 all_rows=[]; summaries=[]
 
@@ -244,7 +314,9 @@ for name,model_cls in models.items():
     for fold,(tr,va) in enumerate(splits,1):
         model,hist,best_epoch=train_one(model_cls,tr,va)
 
+        # Score the original training subset; these fitted-data metrics are not estimates of unseen performance.
         p_train=predict_fold(model,tr)
+        # Score the development validation subset with the current fold model.
         p_val=predict_fold(model,va)
 
         train_row=evaluate(y[tr],p_train)
@@ -262,6 +334,7 @@ for name,model_cls in models.items():
         test_row=evaluate(y_test,np.asarray(probs))
         test_row.update(model=name,fold=fold,split="Test",best_epoch=best_epoch)
 
+        # Store one row per split per fold, keeping model and fold identifiers for later summaries.
         rows.extend([train_row,val_row,test_row])
         all_rows.extend([train_row,val_row,test_row])
         histories.append(hist); best_epochs.append(best_epoch)
@@ -277,12 +350,12 @@ for name,model_cls in models.items():
     summary["CV_best_epoch_median"]=int(np.median(best_epochs))
 
     # Learning curve averaged over folds.
-    tr_loss=np.array([h["train_loss"] for h in histories])
-    va_loss=np.array([h["val_loss"] for h in histories])
-    ep=np.arange(1,EPOCHS+1)
+    tr_loss=mean_learning_curve(histories, 'train_loss')
+    va_loss=mean_learning_curve(histories, 'val_loss')
+    ep=np.arange(1, max(len(h["train_loss"]) for h in histories) + 1)
     plt.figure(figsize=(8,5))
-    plt.plot(ep,tr_loss.mean(0),label="Training loss")
-    plt.plot(ep,va_loss.mean(0),label="Validation loss")
+    plt.plot(ep,tr_loss,label="Training loss")
+    plt.plot(ep,va_loss,label="Validation loss")
     plt.xlabel("Epoch"); plt.ylabel("Cross-entropy loss")
     plt.title(f"{name}: mean learning curve across 10 CV folds")
     plt.legend(); plt.tight_layout()

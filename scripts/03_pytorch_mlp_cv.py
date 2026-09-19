@@ -12,19 +12,27 @@ Evaluation design
 7. This file is self-contained and does not import project helper modules.
 """
 
+# Workflow guide:
+# Build Morgan fingerprints and train a new MLP in each fold. Class weights come from that
+# fold’s training labels. Record completed epochs, restore the lowest-validation-loss checkpoint,
+# and then evaluate training, validation, and test predictions.
+
 # SECTION: Imports, settings, and data
 from pathlib import Path
 import random
 import numpy as np
 import pandas as pd
 
+# Set reproducible pseudo-random seeds; hardware and library differences can still affect results.
 SEED = 42
 N_SPLITS = 10
+# Use the same active-class cutoff throughout this workflow; this is not a tuned threshold.
 THRESHOLD = 0.50
 
 random.seed(SEED)
 np.random.seed(SEED)
 
+# Locate the project from script or notebook execution; notebooks may not define __file__.
 def project_root():
     """Find repository root when run from root, scripts/, or a notebook."""
     candidates = [Path.cwd(), Path.cwd().parent]
@@ -56,8 +64,12 @@ from rdkit.Chem import rdFingerprintGenerator
 
 FP_SIZE = 2048
 MORGAN_RADIUS = 2
+# Initialize the shared fingerprint generator; identical settings are used for development and test molecules.
 fp_gen = rdFingerprintGenerator.GetMorganGenerator(radius=MORGAN_RADIUS, fpSize=FP_SIZE)
 
+# Create one fixed-length binary fingerprint per SMILES, preserving row order.
+# Radius 2 describes local atom neighborhoods; hashed bits can represent multiple fragments.
+# Fail on invalid SMILES instead of silently training on an all-zero placeholder.
 def morgan_matrix(smiles):
     X = np.zeros((len(smiles), FP_SIZE), dtype=np.uint8)
     invalid = []
@@ -78,6 +90,10 @@ from sklearn.metrics import (
     brier_score_loss, confusion_matrix
 )
 
+# Compare binary labels (0 inactive, 1 active) with P(active).
+# ROC AUC measures ranking; PR_AUC keys use average precision, not trapezoidal area.
+# MCC and balanced accuracy summarize label predictions; Brier measures probability error.
+# Reversing labels/probabilities lets the same metrics describe the inactive class.
 def evaluate(y_true, p_active, threshold=THRESHOLD):
     """Evaluate probabilities using the same 0.50 threshold for every classifier."""
     y_true = np.asarray(y_true, dtype=int)
@@ -99,6 +115,9 @@ def evaluate(y_true, p_active, threshold=THRESHOLD):
         "TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp),
     }
 
+# Aggregate metric means and sample standard deviations (ddof=1).
+# When split-specific rows exist, keep Train, Validation, and Test summaries separate.
+# Repeated test predictions come from different models on the same molecules.
 def summarize_cv(df, model_name):
     """Summarize Train, Validation, and Test metrics across the 10 fold-trained models."""
     cols = [
@@ -125,8 +144,9 @@ from sklearn.model_selection import StratifiedKFold
 import matplotlib.pyplot as plt
 
 torch.manual_seed(SEED)
+# Prefer CUDA, then Apple MPS when available, and otherwise use the CPU.
 DEVICE=torch.device("cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends,"mps") and torch.backends.mps.is_available() else "cpu"))
-EPOCHS=30
+EPOCHS = 500
 BATCH_SIZE=128
 
 X=morgan_matrix(train_df.SMILES).astype(np.float32)
@@ -134,6 +154,8 @@ y=train_df.Activity.to_numpy(dtype=np.int64)
 X_test=morgan_matrix(test_df.SMILES).astype(np.float32)
 y_test=test_df.Activity.to_numpy(dtype=np.int64)
 
+# Map fingerprint features through two hidden layers to two raw class scores (logits).
+# CrossEntropyLoss accepts logits directly; use softmax only when probabilities are needed.
 class MLP(nn.Module):
     def __init__(self,input_dim=FP_SIZE):
         super().__init__()
@@ -144,9 +166,44 @@ class MLP(nn.Module):
         )
     def forward(self,x): return self.net(x)
 
+# Calculate inverse-frequency loss weights from the training fold; validation labels do not set weights.
 def class_weights(labels):
     counts=np.bincount(labels,minlength=2).astype(np.float32)
     return torch.tensor(len(labels)/(2*np.maximum(counts,1)),dtype=torch.float32,device=DEVICE)
+
+# Initialize a new network and optimizer, train on this fold, and select the checkpoint by validation loss.
+# Stop after three epochs without a meaningful validation-loss improvement.
+# EPOCHS remains the maximum budget; test metrics never control stopping.
+EARLY_STOPPING_PATIENCE = 3
+EARLY_STOPPING_MIN_DELTA = 1e-4
+
+class EarlyStopping:
+    def __init__(self, patience=EARLY_STOPPING_PATIENCE, min_delta=EARLY_STOPPING_MIN_DELTA):
+        if patience < 1 or min_delta < 0:
+            raise ValueError("patience must be positive and min_delta nonnegative")
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best = float("inf")
+        self.wait = 0
+
+    def update(self, loss):
+        if not np.isfinite(loss):
+            raise RuntimeError("Non-finite validation loss")
+        if loss < self.best - self.min_delta:
+            self.best = loss
+            self.wait = 0
+        else:
+            self.wait += 1
+        return self.wait >= self.patience
+
+def mean_learning_curve(histories, key):
+    # Average only folds that actually reached an epoch; never invent later losses.
+    # Later points can therefore represent fewer folds than earlier points.
+    length = max(len(h[key]) for h in histories)
+    padded = np.full((len(histories), length), np.nan)
+    for i, history in enumerate(histories):
+        padded[i, :len(history[key])] = history[key]
+    return np.nanmean(padded, axis=0)
 
 def run_fold(Xtr,ytr,Xva,yva,epochs=EPOCHS):
     model=MLP().to(DEVICE)
@@ -163,11 +220,13 @@ def run_fold(Xtr,ytr,Xva,yva,epochs=EPOCHS):
     history={"train_loss":[],"val_loss":[]}
     best_state=None; best_loss=float("inf"); best_epoch=1
 
+    stopper = EarlyStopping()
     for epoch in range(1,epochs+1):
         model.train(); total=0.0; n=0
         for xb,yb in tr_loader:
             xb,yb=xb.to(DEVICE),yb.to(DEVICE)
             opt.zero_grad(set_to_none=True)
+            # Calculate supervised loss, backpropagate gradients, and update model parameters.
             loss=loss_fn(model(xb),yb)
             loss.backward(); opt.step()
             total+=loss.item()*len(yb); n+=len(yb)
@@ -177,26 +236,36 @@ def run_fold(Xtr,ytr,Xva,yva,epochs=EPOCHS):
         with torch.no_grad():
             logits=model(Xva_t)
             val_loss=loss_fn(logits,yva_t).item()
+            # Score the development validation subset with the current fold model.
             p_val=torch.softmax(logits,dim=1)[:,1].cpu().numpy()
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        # Save the parameters at the lowest validation loss observed so far.
         if val_loss<best_loss:
             best_loss=val_loss; best_epoch=epoch
             best_state={k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
+        # Checkpoint selection above still keeps the absolute lowest loss.
+        if stopper.update(val_loss):
+            print(f"Early stopping after {len(history['val_loss'])} epochs; restoring best checkpoint.")
+            break
 
+    # Use the lowest-validation-loss model, which may precede the final epoch.
     model.load_state_dict(best_state)
     model.eval()
 
     # Probabilities from the best checkpoint for BOTH CV splits.
     Xtr_t=torch.from_numpy(Xtr.astype(np.float32)).to(DEVICE)
     with torch.no_grad():
+        # Score the original training subset; these fitted-data metrics are not estimates of unseen performance.
         p_train=torch.softmax(model(Xtr_t),dim=1)[:,1].cpu().numpy()
+        # Score the development validation subset with the current fold model.
         p_val=torch.softmax(model(Xva_t),dim=1)[:,1].cpu().numpy()
 
     return model,p_train,p_val,history,best_epoch
 
 # SECTION: 10-fold CV
+# Preserve class proportions when splitting development rows; this is not scaffold-grouped CV.
 skf=StratifiedKFold(n_splits=N_SPLITS,shuffle=True,random_state=SEED)
 fold_rows=[]; histories=[]; best_epochs=[]
 
@@ -232,12 +301,12 @@ summary=summarize_cv(fold_df,"PyTorch_MLP")
 summary["CV_best_epoch_median"]=int(np.median(best_epochs))
 
 # SECTION: Plot epoch vs training/validation loss
-train_losses=np.array([h["train_loss"] for h in histories])
-val_losses=np.array([h["val_loss"] for h in histories])
-epochs=np.arange(1,EPOCHS+1)
+train_losses=mean_learning_curve(histories, 'train_loss')
+val_losses=mean_learning_curve(histories, 'val_loss')
+epochs=np.arange(1, max(len(h["train_loss"]) for h in histories) + 1)
 plt.figure(figsize=(8,5))
-plt.plot(epochs,train_losses.mean(axis=0),label="Training loss")
-plt.plot(epochs,val_losses.mean(axis=0),label="Validation loss")
+plt.plot(epochs,train_losses,label="Training loss")
+plt.plot(epochs,val_losses,label="Validation loss")
 plt.xlabel("Epoch"); plt.ylabel("Cross-entropy loss")
 plt.title("MLP: mean learning curve across 10 CV folds")
 plt.legend(); plt.tight_layout()
@@ -245,6 +314,7 @@ plt.savefig(RESULTS/"03_mlp_epoch_vs_loss.png",dpi=180)
 plt.show()
 
 # SECTION: Save fold-level and mean±SD results
+# Export fold-level results without adding a pandas index column.
 fold_df.to_csv(RESULTS/"03_mlp_cv_folds.csv",index=False)
 pd.DataFrame([summary]).to_csv(RESULTS/"03_mlp_summary.csv",index=False)
 print(pd.DataFrame([summary]).to_string(index=False))

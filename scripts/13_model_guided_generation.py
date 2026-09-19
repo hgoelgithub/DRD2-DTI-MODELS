@@ -1,16 +1,17 @@
 """
 Simple model-guided analog generation
 
-Evaluation design
------------------
-1. D2_training_set_Ki.csv is the development dataset.
-2. StratifiedKFold(n_splits=10, shuffle=True, random_state=42) is applied only to that training dataset.
-3. Each fold trains on 9/10 of the development data and validates on 1/10.
-4. D2_test_scaffold_split_Ki.csv is never part of cross-validation.
-5. After CV, a final model is trained on all development data and evaluated once on the held-out test data.
-6. Threshold-based metrics use one fixed threshold: 0.50.
-7. This file is self-contained and does not import project helper modules.
+Workflow
+--------
+Fit a random-forest scorer on all development molecules, fragment a sample of active compounds with BRICS, recombine fragments, filter molecular weight, and rank up to 500 candidates. This is candidate generation, not CV; predicted scores do not establish experimental activity or synthetic feasibility.
+This file is self-contained and does not import project helper modules.
 """
+
+# Workflow guide:
+# Fit a random-forest scorer on all development molecules, fragment a sample of active
+# compounds with BRICS, recombine fragments, filter molecular weight, and rank up to 500
+# candidates. This is candidate generation, not CV; predicted scores do not establish
+# experimental activity or synthetic feasibility.
 
 # SECTION: Imports, settings, and data
 from pathlib import Path
@@ -18,11 +19,14 @@ import random
 import numpy as np
 import pandas as pd
 
+# Set reproducible pseudo-random seeds; hardware and library differences can still affect results.
 SEED=42
 N_SPLITS=10
+# Use the same active-class cutoff throughout this workflow; this is not a tuned threshold.
 THRESHOLD=0.50
 random.seed(SEED); np.random.seed(SEED)
 
+# Locate the project from script or notebook execution; notebooks may not define __file__.
 def project_root():
     candidates=[Path.cwd(),Path.cwd().parent]
     if "__file__" in globals(): candidates.insert(0,Path(__file__).resolve().parents[1])
@@ -41,7 +45,11 @@ print(f"Test:     {test_df.shape} | active fraction={test_df.Activity.mean():.4f
 from rdkit import Chem,DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 FP_SIZE=2048; MORGAN_RADIUS=2
+# Initialize the shared fingerprint generator; identical settings are used for development and test molecules.
 fp_gen=rdFingerprintGenerator.GetMorganGenerator(radius=MORGAN_RADIUS,fpSize=FP_SIZE)
+# Create one fixed-length binary fingerprint per SMILES, preserving row order.
+# Radius 2 describes local atom neighborhoods; hashed bits can represent multiple fragments.
+# Fail on invalid SMILES instead of silently training on an all-zero placeholder.
 def morgan_matrix(smiles):
     X=np.zeros((len(smiles),FP_SIZE),dtype=np.uint8); invalid=[]
     for i,s in enumerate(smiles):
@@ -54,15 +62,20 @@ def morgan_matrix(smiles):
 from sklearn.ensemble import RandomForestClassifier
 from rdkit.Chem import BRICS,Descriptors
 X=morgan_matrix(train_df.SMILES); y=train_df.Activity.to_numpy(dtype=np.int64); model=RandomForestClassifier(n_estimators=300,class_weight='balanced_subsample',n_jobs=-1,random_state=SEED); model.fit(X,y)
+# Choose active development molecules as fragment sources; test molecules are not used as seeds.
 seed_smiles=train_df.loc[train_df.Activity==1,'SMILES'].sample(min(150,(train_df.Activity==1).sum()),random_state=SEED); fragments=set()
 for s in seed_smiles:
     mol=Chem.MolFromSmiles(s)
     if mol: fragments.update(BRICS.BRICSDecompose(mol))
+# Parse the unique BRICS fragments into molecules that can be recombined.
 frag_mols=[Chem.MolFromSmiles(x) for x in fragments if Chem.MolFromSmiles(x) is not None]; candidates=[]
+# Enumerate limited-depth fragment recombinations; candidates are not guaranteed novel or synthesizable.
 for mol in BRICS.BRICSBuild(frag_mols,maxDepth=2):
     s=Chem.MolToSmiles(mol,canonical=True)
+    # Keep candidates in the specified molecular-weight range and stop at the candidate budget.
     if 150<=Descriptors.MolWt(mol)<=650: candidates.append(s)
     if len(candidates)>=500: break
 if candidates:
+    # Score generated fingerprints and sort by predicted activity; these predictions need experimental validation.
     Xc=morgan_matrix(pd.Series(candidates)); p=model.predict_proba(Xc)[:,1]; out=pd.DataFrame({'SMILES':candidates,'predicted_active_probability':p}).sort_values('predicted_active_probability',ascending=False); out.to_csv(RESULTS/'13_generated_candidates.csv',index=False); print(out.head(20).to_string(index=False))
 else: print('No candidates generated.')

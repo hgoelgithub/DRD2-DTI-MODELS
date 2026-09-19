@@ -12,19 +12,28 @@ Evaluation design
 7. This file is self-contained and does not import project helper modules.
 """
 
+# Workflow guide:
+# Convert molecules to Morgan fingerprints, then compare five classifiers on the same
+# stratified development folds. Clone a fresh estimator for each fold. Report training,
+# validation, and held-out test metrics separately; test rows reuse the same test molecules
+# across folds.
+
 # SECTION: Imports, settings, and data
 from pathlib import Path
 import random
 import numpy as np
 import pandas as pd
 
+# Set reproducible pseudo-random seeds; hardware and library differences can still affect results.
 SEED = 42
 N_SPLITS = 10
+# Use the same active-class cutoff throughout this workflow; this is not a tuned threshold.
 THRESHOLD = 0.50
 
 random.seed(SEED)
 np.random.seed(SEED)
 
+# Locate the project from script or notebook execution; notebooks may not define __file__.
 def project_root():
     """Find repository root when run from root, scripts/, or a notebook."""
     candidates = [Path.cwd(), Path.cwd().parent]
@@ -56,8 +65,12 @@ from rdkit.Chem import rdFingerprintGenerator
 
 FP_SIZE = 2048
 MORGAN_RADIUS = 2
+# Initialize the shared fingerprint generator; identical settings are used for development and test molecules.
 fp_gen = rdFingerprintGenerator.GetMorganGenerator(radius=MORGAN_RADIUS, fpSize=FP_SIZE)
 
+# Create one fixed-length binary fingerprint per SMILES, preserving row order.
+# Radius 2 describes local atom neighborhoods; hashed bits can represent multiple fragments.
+# Fail on invalid SMILES instead of silently training on an all-zero placeholder.
 def morgan_matrix(smiles):
     X = np.zeros((len(smiles), FP_SIZE), dtype=np.uint8)
     invalid = []
@@ -78,6 +91,10 @@ from sklearn.metrics import (
     brier_score_loss, confusion_matrix
 )
 
+# Compare binary labels (0 inactive, 1 active) with P(active).
+# ROC AUC measures ranking; PR_AUC keys use average precision, not trapezoidal area.
+# MCC and balanced accuracy summarize label predictions; Brier measures probability error.
+# Reversing labels/probabilities lets the same metrics describe the inactive class.
 def evaluate(y_true, p_active, threshold=THRESHOLD):
     """Evaluate probabilities using the same 0.50 threshold for every classifier."""
     y_true = np.asarray(y_true, dtype=int)
@@ -99,6 +116,9 @@ def evaluate(y_true, p_active, threshold=THRESHOLD):
         "TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp),
     }
 
+# Aggregate metric means and sample standard deviations (ddof=1).
+# When split-specific rows exist, keep Train, Validation, and Test summaries separate.
+# Repeated test predictions come from different models on the same molecules.
 def summarize_cv(df, model_name):
     """Summarize Train, Validation, and Test metrics across the 10 fold-trained models."""
     cols = [
@@ -144,9 +164,11 @@ models = {
     "MultinomialNB": MultinomialNB(alpha=1.0),
 }
 
+# Preserve class proportions when splitting development rows; this is not scaffold-grouped CV.
 skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
 all_folds, summaries = [], []
 
+# Give each class equal total sample weight using only the current training labels.
 def balanced_sample_weights(labels):
     labels=np.asarray(labels)
     n=len(labels)
@@ -158,13 +180,16 @@ for model_name, template in models.items():
     print(f"\n===== {model_name} =====")
     fold_rows=[]
     for fold,(tr,va) in enumerate(skf.split(X,y),1):
+        # Start with an unfitted copy so learned state cannot carry over between folds.
         model=clone(template)
         if model_name=="XGBoost_balanced":
             model.fit(X[tr],y[tr],sample_weight=balanced_sample_weights(y[tr]))
         else:
             model.fit(X[tr],y[tr])
         # Evaluate both the 90% training portion and the 10% validation portion.
+        # Score the original training subset; these fitted-data metrics are not estimates of unseen performance.
         p_train=model.predict_proba(X[tr])[:,1]
+        # Score the development validation subset with the current fold model.
         p_val=model.predict_proba(X[va])[:,1]
 
         train_row=evaluate(y[tr],p_train)

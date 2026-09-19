@@ -1,7 +1,7 @@
 # Reading guide: Tune HEAD_LR, HEAD_HIDDEN, and HEAD_DROPOUT using development
 # validation results. The 0.50 threshold and class weighting remain fixed here.
 """
-ChemBERTa frozen embeddings + normalized MLP head with 10-fold CV
+ChemBERTa partial fine-tuning + normalized MLP head with 10-fold CV
 
 Evaluation design
 -----------------
@@ -15,9 +15,10 @@ Evaluation design
 """
 
 # Workflow guide:
-# Reuse cached frozen embeddings, then train a fresh LayerNorm/MLP per fold.
-# Only the small head is optimized; the encoder runs once per uncached dataset.
-# For encoder fine-tuning, use 06B_chemberta_finetuning_cv instead.
+# Tokenize SMILES, initialize a fresh pretrained ChemBERTa per fold, and update only its
+# final transformer blocks plus a LayerNorm/MLP head. Validation loss selects checkpoints.
+# Batched predictions produce metrics and separate fine-tuned output files; old frozen
+# embeddings are not used.
 
 # SECTION: Imports, settings, and data
 from pathlib import Path
@@ -90,7 +91,7 @@ def summarize_cv(df, model_name):
             out[f"{prefix}_{c}_mean"] = part[c].mean()
             out[f"{prefix}_{c}_std"] = part[c].std(ddof=1)
     return out
-# SECTION: Frozen encoder and cached embeddings
+# SECTION: Pretrained encoder and tokenization
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -98,60 +99,42 @@ from sklearn.model_selection import StratifiedKFold
 import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, AutoModel
 
-# Step 3: Extract fixed pretrained features without updating the encoder.
+# Step 3: Fine-tune only the last two transformer blocks. Earlier blocks stay frozen.
+# Use a smaller encoder learning rate to avoid large changes to pretrained weights.
 MODEL_ID = "DeepChem/ChemBERTa-100M-MLM"
 TRUST_REMOTE_CODE = False
+UNFREEZE_LAST_N = 2
+ENCODER_LR = 2e-5
 HEAD_LR = 1e-3
 HEAD_HIDDEN = 256
 HEAD_DROPOUT = 0.25
 WEIGHT_DECAY = 1e-4
 EPOCHS = 500
-BATCH_SIZE = 128
-EMBED_BATCH_SIZE = 16
+BATCH_SIZE = 16
 MAX_LENGTH = 256
-MODEL_NAME = "ChemBERTa_frozen_LayerNorm"
-OUTPUT_PREFIX = "06_ChemBERTa_frozen_LayerNorm"
+MODEL_NAME = "ChemBERTa_finetuned_LayerNorm"
+OUTPUT_PREFIX = "06B_ChemBERTa_finetuned"
 torch.manual_seed(SEED)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else (
     "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"))
 
-def mean_pool(hidden, mask):
-    # Ignore padding when averaging token vectors; unmasked special tokens remain.
-    mask = mask.unsqueeze(-1).to(hidden.dtype)
-    return (hidden * mask).sum(1) / mask.sum(1).clamp(min=1)
+# Tokenization has no fitted statistics and may be shared across folds.
+# Old frozen-embedding caches cannot be used: embeddings now change during training.
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=TRUST_REMOTE_CODE)
 
-def extract_embeddings(smiles, cache_path):
-    # Reuse the original frozen caches for speed. Row count alone cannot detect
-    # changed SMILES/order or encoder settings: delete these caches if those change.
-    if cache_path.exists():
-        arr = np.load(cache_path)
-        if arr.ndim == 2 and len(arr) == len(smiles):
-            print("Loaded cached embeddings:", cache_path.name)
-            return arr.astype(np.float32)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=TRUST_REMOTE_CODE)
-    encoder = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=TRUST_REMOTE_CODE).to(DEVICE)
-    encoder.requires_grad_(False)
-    encoder.eval()
-    texts = list(smiles.astype(str))
-    chunks = []
-    for start in range(0, len(texts), EMBED_BATCH_SIZE):
-        tokens = tokenizer(texts[start:start + EMBED_BATCH_SIZE], padding=True,
-                           truncation=True, max_length=MAX_LENGTH, return_tensors="pt")
-        tokens = {k: v.to(DEVICE) for k, v in tokens.items()}
-        with torch.no_grad():
-            hidden = encoder(**tokens).last_hidden_state
-            pooled = mean_pool(hidden, tokens["attention_mask"])
-        chunks.append(pooled.cpu().numpy().astype(np.float32))
-        print(f"encoded {min(start + EMBED_BATCH_SIZE, len(texts))}/{len(texts)}")
-    arr = np.concatenate(chunks)
-    np.save(cache_path, arr)
-    return arr
+def tokenize(smiles):
+    return tokenizer(list(smiles.astype(str)), padding="max_length", truncation=True,
+                     max_length=MAX_LENGTH, return_tensors="pt")
 
-# No activity labels enter feature extraction, so the fixed features are shared across folds.
-X = extract_embeddings(train_df.SMILES, RESULTS / "06_ChemBERTa_train_embeddings.npy")
-X_test = extract_embeddings(test_df.SMILES, RESULTS / "06_ChemBERTa_test_embeddings.npy")
+train_tokens = tokenize(train_df.SMILES)
+test_tokens = tokenize(test_df.SMILES)
 y = train_df.Activity.to_numpy(dtype=np.int64)
 y_test = test_df.Activity.to_numpy(dtype=np.int64)
+
+def mean_pool(hidden, mask):
+    # Exclude padding from the token average; unmasked special tokens are included.
+    mask = mask.unsqueeze(-1).to(hidden.dtype)
+    return (hidden * mask).sum(1) / mask.sum(1).clamp(min=1)
 
 # SECTION: Normalized classifier and fold training
 class Head(nn.Module):
@@ -167,16 +150,47 @@ class Head(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class ChemBERTaClassifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Reload the original pretrained weights for EVERY fold, preventing
+        # training on one fold from leaking into the next fold's validation set.
+        self.encoder = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=TRUST_REMOTE_CODE)
+        blocks = self.encoder.encoder.layer  # RoBERTa blocks in this ChemBERTa model.
+        if not 1 <= UNFREEZE_LAST_N <= len(blocks):
+            raise ValueError("UNFREEZE_LAST_N must be between 1 and the number of encoder layers")
+        for param in self.encoder.parameters():
+            param.requires_grad_(False)
+        for block in blocks[-UNFREEZE_LAST_N:]:
+            for param in block.parameters():
+                param.requires_grad_(True)
+        self.head = Head(self.encoder.config.hidden_size)
+
+    def train(self, mode=True):
+        super().train(mode)
+        # Keep dropout disabled in frozen blocks, while allowing dropout in the
+        # trainable final blocks and head during training.
+        self.encoder.eval()
+        if mode:
+            for block in self.encoder.encoder.layer[-UNFREEZE_LAST_N:]:
+                block.train()
+        return self
+
+    def forward(self, input_ids, attention_mask):
+        hidden = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        # Do not use no_grad here: final encoder blocks must receive gradients.
+        return self.head(mean_pool(hidden, attention_mask))
+
 def class_weights(labels):
     # Preserve the existing inverse-frequency class weights, using training labels only.
     counts = np.bincount(labels, minlength=2).astype(np.float32)
     return torch.tensor(len(labels) / (2 * np.maximum(counts, 1)),
                         dtype=torch.float32, device=DEVICE)
 
-def make_loader(features, labels, indices, shuffle=False):
-    # Copy only the requested fold's fixed feature rows into a CPU tensor dataset.
-    dataset = TensorDataset(torch.from_numpy(features[indices]),
-                            torch.as_tensor(labels[indices], dtype=torch.long))
+def make_loader(tokens, labels, indices, shuffle=False):
+    indices = torch.as_tensor(indices, dtype=torch.long)
+    dataset = TensorDataset(tokens["input_ids"][indices], tokens["attention_mask"][indices],
+                            torch.as_tensor(labels, dtype=torch.long)[indices])
     return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=shuffle)
 
 def predict(model, loader, loss_fn=None):
@@ -185,9 +199,9 @@ def predict(model, loader, loss_fn=None):
     probabilities = []
     loss_sum = weight_sum = 0.0
     with torch.no_grad():
-        for features, labels in loader:
-            features, labels = features.to(DEVICE), labels.to(DEVICE)
-            logits = model(features)
+        for ids, mask, labels in loader:
+            ids, mask, labels = ids.to(DEVICE), mask.to(DEVICE), labels.to(DEVICE)
+            logits = model(ids, mask)
             probabilities.append(torch.softmax(logits, dim=1)[:, 1].cpu().numpy())
             if loss_fn is not None:
                 # Exact weighted mean over the complete split, independent of batch sizes.
@@ -230,12 +244,15 @@ def mean_learning_curve(histories, key):
     return np.nanmean(padded, axis=0)
 
 def train_fold(tr, va):
-    # Step 6: Train a fresh normalized head per fold on the fixed feature matrix.
-    model = Head(X.shape[1]).to(DEVICE)
+    # Step 6: Fresh encoder/head/optimizer and validation-selected checkpoint per fold.
+    model = ChemBERTaClassifier().to(DEVICE)
     loss_fn = nn.CrossEntropyLoss(weight=class_weights(y[tr]))
-    opt = torch.optim.AdamW(model.parameters(), lr=HEAD_LR, weight_decay=WEIGHT_DECAY)
-    loader = make_loader(X, y, tr, shuffle=True)
-    val_loader = make_loader(X, y, va)
+    opt = torch.optim.AdamW([
+        {"params": [p for p in model.encoder.parameters() if p.requires_grad], "lr": ENCODER_LR},
+        {"params": model.head.parameters(), "lr": HEAD_LR},
+    ], weight_decay=WEIGHT_DECAY)
+    loader = make_loader(train_tokens, y, tr, shuffle=True)
+    val_loader = make_loader(train_tokens, y, va)
     hist = {"train_loss": [], "val_loss": []}
     best = None
     best_loss = float("inf")
@@ -244,10 +261,10 @@ def train_fold(tr, va):
     for epoch in range(1, EPOCHS + 1):
         model.train()
         total = weight_total = 0.0
-        for features, labels in loader:
-            features, labels = features.to(DEVICE), labels.to(DEVICE)
+        for ids, mask, labels in loader:
+            ids, mask, labels = ids.to(DEVICE), mask.to(DEVICE), labels.to(DEVICE)
             opt.zero_grad(set_to_none=True)
-            loss = loss_fn(model(features), labels)
+            loss = loss_fn(model(ids, mask), labels)
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite training loss")
             loss.backward()
@@ -270,7 +287,7 @@ def train_fold(tr, va):
     if best is None:
         raise RuntimeError("No finite validation checkpoint was produced")
     model.load_state_dict(best)
-    p_train, _ = predict(model, make_loader(X, y, tr))
+    p_train, _ = predict(model, make_loader(train_tokens, y, tr))
     p_val, _ = predict(model, val_loader)
     return model, p_train, p_val, hist, best_epoch
 
@@ -291,14 +308,14 @@ for fold,(tr,va) in enumerate(skf.split(np.zeros(len(y)),y),1):
     val_row.update(model=MODEL_NAME,fold=fold,split="Validation",best_epoch=b)
 
     # Test labels are used only for reporting, never for checkpoint selection.
-    p_test, _ = predict(model, make_loader(X_test, y_test, np.arange(len(y_test))))
+    p_test, _ = predict(model, make_loader(test_tokens, y_test, np.arange(len(y_test))))
     test_row=evaluate(y_test,p_test)
     test_row.update(model=MODEL_NAME,fold=fold,split="Test",best_epoch=b)
 
     # Save three metric rows per fold and retain histories for the learning-curve plot.
     rows.extend([train_row,val_row,test_row])
     histories.append(h); best_epochs.append(b)
-    del model  # Release the head before training the next fold.
+    del model  # Release this fold before constructing the next encoder.
 
     print(
         f"fold {fold:02d}: "
@@ -316,7 +333,7 @@ fold_df=pd.DataFrame(rows); summary=summarize_cv(fold_df,MODEL_NAME); summary["C
 # These curves show completed epochs only; later points may average fewer folds.
 tr_loss=mean_learning_curve(histories, 'train_loss'); va_loss=mean_learning_curve(histories, 'val_loss'); ep=np.arange(1, max(len(h["train_loss"]) for h in histories) + 1)
 plt.figure(figsize=(8,5)); plt.plot(ep,tr_loss,label="Training loss"); plt.plot(ep,va_loss,label="Validation loss")
-plt.xlabel("Epoch"); plt.ylabel("Cross-entropy loss"); plt.title('Frozen ChemBERTa + LayerNorm: mean learning curve across 10 CV folds'); plt.legend(); plt.tight_layout()
+plt.xlabel("Epoch"); plt.ylabel("Cross-entropy loss"); plt.title('Fine-tuned ChemBERTa: mean learning curve across 10 CV folds'); plt.legend(); plt.tight_layout()
 # Save the learning-curve PNG before displaying it in the notebook.
 plt.savefig(RESULTS/f"{OUTPUT_PREFIX}_epoch_vs_loss.png",dpi=180); plt.show()
 
